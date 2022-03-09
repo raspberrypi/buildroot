@@ -93,6 +93,18 @@ config BR2_PACKAGE_RPI_FIRMWARE_INSTALL_DTB_OVERLAYS
 	  overlays, to support HATs (Hardware Attached on Top, add-on
 	  modules).
 
+config BR2_PACKAGE_RPI_FIRMWARE_INSTALL_DTB_OVERLAYS_TO_TARGET
+	bool "Install DTB overlays to the root file-system"
+	default n
+	depends on BR2_PACKAGE_RPI_FIRMWARE_INSTALL_DTBS \
+		|| BR2_LINUX_KERNEL_DTS_SUPPORT
+	select BR2_LINUX_KERNEL_DTB_OVERLAY_SUPPORT \
+		if BR2_LINUX_KERNEL_DTS_SUPPORT
+	help
+	  Say 'y' here if you want to use dtoverlay to load overlays
+	  after booting on a system just contains an ramdisk for the
+	  root filesystem and does mount a separate boot partition.
+
 config BR2_PACKAGE_RPI_FIRMWARE_INSTALL_VCDBG
 	bool "vcdbg"
 	depends on BR2_arm # prebuilt arm binary, rpi-userland

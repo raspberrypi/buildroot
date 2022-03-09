@@ -58,6 +58,19 @@ define RPI_FIRMWARE_INSTALL_DTB_OVERLAYS
 endef
 endif
 
+# Install the overlays to /boot/overlays on the target file-system.
+ifeq ($(BR2_PACKAGE_RPI_FIRMWARE_INSTALL_DTB_OVERLAYS_TO_TARGET),y)
+define RPI_FIRMWARE_INSTALL_DTB_OVERLAYS_TO_TARGET
+	$(foreach ovldtb,$(wildcard $(@D)/boot/overlays/*.dtb*), \
+		$(INSTALL) -D -m 0644 $(ovldtb) $(TARGET_DIR)/boot/overlays/$(notdir $(ovldtb))
+	)
+	$(INSTALL) -D -m 0644 $(@D)/boot/overlays/README $(TARGET_DIR)/boot/overlays/README
+endef
+define RPI_FIRMWARE_INSTALL_TARGET_CMDS
+	$(RPI_FIRMWARE_INSTALL_DTB_OVERLAYS_TO_TARGET)
+endef
+endif
+
 # Install prebuilt libraries if RPI_USERLAND not enabled
 ifneq ($(BR2_PACKAGE_RPI_USERLAND),y)
 define RPI_FIRMWARE_INSTALL_TARGET_LIB
@@ -70,6 +83,7 @@ endif
 
 ifeq ($(BR2_PACKAGE_RPI_FIRMWARE_INSTALL_VCDBG),y)
 define RPI_FIRMWARE_INSTALL_TARGET_CMDS
+	$(RPI_FIRMWARE_INSTALL_IMAGES_CMDS)
 	$(INSTALL) -D -m 0700 $(@D)/$(if BR2_ARM_EABIHF,hardfp/)opt/vc/bin/vcdbg \
 		$(TARGET_DIR)/usr/sbin/vcdbg
 	$(INSTALL) -D -m 0644 $(@D)/$(if BR2_ARM_EABIHF,hardfp/)opt/vc/lib/libelftoolchain.so \
