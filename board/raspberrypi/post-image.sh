@@ -17,6 +17,13 @@ ROOTPATH_TMP="$(mktemp -d)"
 
 rm -rf "${GENIMAGE_TMP}"
 
+# start.elf supports compressed 64-bit kernel images.
+if [ -f ${BINARIES_DIR}/Image ]; then
+   rm -f ${BINARIES_DIR}/Image.gz ${BINARIES_DIR}/kernel8.img
+   gzip ${BINARIES_DIR}/Image
+   mv ${BINARIES_DIR}/Image.gz ${BINARIES_DIR}/kernel8.img
+fi
+
 genimage \
 	--rootpath "${ROOTPATH_TMP}"   \
 	--tmppath "${GENIMAGE_TMP}"    \
