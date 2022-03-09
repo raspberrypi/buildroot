@@ -69,6 +69,12 @@ config BR2_PACKAGE_RPI_FIRMWARE_CONFIG_FILE
 	  Path to a file stored as config.txt in the boot partiton
 	  of the generated SD card image.
 
+config BR2_PACKAGE_RPI_FIRMWARE_CMDLINE_FILE
+	string "Path to a file stored as boot/cmdline-custom.txt"
+	help
+	  Path to a file stored as cmdline-custom.txt in the boot partition
+	  of the generated SD card image.
+
 config BR2_PACKAGE_RPI_FIRMWARE_INSTALL_DTBS
 	bool "Install Device Tree Blobs (DTBs)"
 	default y
