@@ -1,0 +1,28 @@
+config BR2_PACKAGE_RASPBERRYPI_SECURE_BOOT
+	bool "raspberrypi-secure-boot"
+	select BR2_PACKAGE_LIBOPENSSL_BIN
+	help
+	  Raspberry Pi secure-boot tools.
+
+	  https://github.com/raspberrypi/usbboot
+
+config BR2_PACKAGE_RASPBERRYPI_SECURE_BOOT_ADMIN_SSH_LOGIN
+	string "admin ssh authorized keys"
+	default ""
+	depends on BR2_PACKAGE_RASPBERRYPI_SECURE_BOOT
+
+	help
+	    For DEBUG, enable SSH login for an admin user by specifying the
+	    name of a file that will be copied to /home/admin/.ssh/authorized_keys
+
+config BR2_PACKAGE_RASPBERRYPI_SECURE_BOOT_PRIVATE_KEY
+	string "Private key"
+	default ""
+	depends on BR2_PACKAGE_RASPBERRYPI_SECURE_BOOT
+
+	help
+	    The filenmame of the RSA private key in PEM format that will be used
+	    to to sign boot.img. If this config is not defined then image will
+	    be left unsigned but could be signed at a later date by running
+	    the scripts in usbboot/tools manually.
+
