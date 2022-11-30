@@ -3215,6 +3215,9 @@ F:	support/testing/tests/toolchain/test_external_arm.py
 F:	support/testing/tests/toolchain/test_external_synopsys.py
 F:	toolchain/
 
+N:	Tim Gover <tim.gover@raspberrypi.com>
+F:	package/rpi-eeprom
+
 N:	Timo Ketola <timo.ketola@exertus.fi>
 F:	package/fbgrab/
 

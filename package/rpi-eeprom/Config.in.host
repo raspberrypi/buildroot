@@ -1,0 +1,10 @@
+config BR2_PACKAGE_HOST_RPI_EEPROM
+	bool "host rpi-eeprom"
+	select BR2_PACKAGE_HOST_OPENSSL_FORCE_LIBOPENSSL
+	select BR2_PACKAGE_HOST_OPENSSL
+	select BR2_PACKAGE_HOST_PYTHON3
+	select BR2_PACKAGE_HOST_PYTHON_PYCRYPTODOMEX
+	help
+	  Raspberry Pi tools for updating and signing the bootloader configuration.
+
+	  https://github.com/raspberrypi/rpi-eeprom
