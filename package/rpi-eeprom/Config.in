@@ -1,0 +1,30 @@
+config BR2_PACKAGE_RPI_EEPROM
+	bool "rpi-eeprom"
+	select BR2_PACKAGE_LIBOPENSSL_BIN
+	select BR2_PACKAGE_PYTHON3
+	select BR2_PACKAGE_PYTHON_PYCRYPTODOMEX
+	help
+	  Raspberry Pi bootloader tools.
+
+	  https://github.com/raspberrypi/rpi-eeprom
+
+config BR2_PACKAGE_RPI_EEPROM_PRIVATE_KEY
+	string "Private key"
+	default ""
+	depends on BR2_PACKAGE_RPI_EEPROM
+
+	help
+	    The filenmame of the RSA private key in PEM format that will be used
+	    to to sign boot.img. If this config is not defined then image will
+	    be left unsigned but could be signed at a later date by running
+	    the scripts in usbboot/tools manually.
+
+config BR2_PACKAGE_RPI_EEPROM_ADMIN_SSH_LOGIN
+	string "admin ssh authorized keys"
+	default ""
+	depends on BR2_PACKAGE_RPI_EEPROM
+
+	help
+	    For DEBUG, enable SSH login for an admin user by specifying the
+	    name of a file that will be copied to /home/admin/.ssh/authorized_keys
+
