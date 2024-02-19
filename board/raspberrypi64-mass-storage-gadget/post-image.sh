@@ -24,12 +24,13 @@ if [ -f ${BINARIES_DIR}/Image ]; then
    mv ${BINARIES_DIR}/Image.gz ${BINARIES_DIR}/kernel8.img
 fi
 
+KERNEL_VERSION=linux-rpi-6.6.y
 # Hack: Prefer the kernel overlays to the rpi-firmware versions
 rm -rf "${BINARIES_DIR}/rpi-firmware/overlays"
 mkdir -p "${BINARIES_DIR}/rpi-firmware/overlays"
-cp "${BINARIES_DIR}/../build/linux-rpi-6.1.y/arch/arm/boot/dts/overlays/"*.dtb "${BINARIES_DIR}/rpi-firmware/overlays"
-cp "${BINARIES_DIR}/../build/linux-rpi-6.1.y/arch/arm/boot/dts/overlays/"*.dtbo "${BINARIES_DIR}/rpi-firmware/overlays"
-touch "${BINARIES_DIR}/../build/linux-rpi-6.1.y/arch/arm/boot/dts/overlays" "${BINARIES_DIR}/rpi-firmware/overlays/README"
+cp "${BINARIES_DIR}/../build/${KERNEL_VERSION}/arch/arm/boot/dts/overlays/"*.dtb "${BINARIES_DIR}/rpi-firmware/overlays"
+cp "${BINARIES_DIR}/../build/${KERNEL_VERSION}/arch/arm/boot/dts/overlays/"*.dtbo "${BINARIES_DIR}/rpi-firmware/overlays"
+touch "${BINARIES_DIR}/../build/${KERNEL_VERSION}/arch/arm/boot/dts/overlays" "${BINARIES_DIR}/rpi-firmware/overlays/README"
 
 genimage \
 	--rootpath "${ROOTPATH_TMP}"   \
