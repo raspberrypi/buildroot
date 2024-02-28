@@ -57,6 +57,17 @@ for dev in mmcblk0 nvme0n1 sda sdb sdc sdd; do
       id=$((id + 1))
    fi
 done
-ls /sys/class/udc > UDC
 
-echo "Mass storage gadget init complete"
+count=0
+while [ ${count} -lt 15 ]; do
+   udc="$(ls /sys/class/udc)"
+   if [ -n "${udc}" ]; then
+      echo "Found UDC ${udc}"
+      echo "${udc}" > UDC
+      break
+   fi
+   count=$((count + 1))
+   sleep 1
+done
+
+echo "Mass storage gadget init complete - $(cat UDC)"
