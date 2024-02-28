@@ -4,9 +4,7 @@ Description=Mass storage gadget
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/configure-gadgets
-TTYPath=/dev/tty0
-TTYReset=yes
-StandardOutput=tty
+StandardOutput=journal+console
 
 [Install]
 WantedBy=multi-user.target
