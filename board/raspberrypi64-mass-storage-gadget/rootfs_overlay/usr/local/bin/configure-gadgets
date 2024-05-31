@@ -12,9 +12,9 @@ if [ -d "${CONFIGFS}" ]; then
 fi
 
 # Disable activity LED, otherwise eMMC will be disabled on CM3
-if [ -e /sys/class/leds/led0 ]; then
-	echo none > /sys/class/leds/led0/trigger
-	echo 0 > /sys/class/leds/led0/brightness
+if grep -q 2837 /proc/device-tree/compatible; then
+   vcmailbox 0x00038043 20 4 129 1 0 0 1 || true
+   sleep 3
 fi
 
 if lspci | grep -iq "USB Controller"; then

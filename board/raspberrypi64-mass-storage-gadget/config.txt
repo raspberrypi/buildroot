@@ -5,8 +5,8 @@ enable_uart=1
 uart_2ndstage=1
 disable_overscan=1
 dtoverlay=dwc2,dr_mode=peripheral
-# Set GPU mem to < 32 for cutdown firmware
-gpu_mem=16
+start_file=start4.elf
+fixup_file=fixup4.dat
 
 [pi5]
 # Limit clock frequencies because this is likely to be powered 
