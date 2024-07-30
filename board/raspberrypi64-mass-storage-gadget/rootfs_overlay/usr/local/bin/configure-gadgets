@@ -40,7 +40,7 @@ grep Serial /proc/cpuinfo | awk '{print $3}'    > strings/0x409/serialnumber
 echo "Raspberry Pi"                             > strings/0x409/manufacturer
 echo "Raspberry Pi multi-function USB device"   > strings/0x409/product
 mkdir -p configs/c.1/strings/0x409
-echo "Config 1: ECM network" > configs/c.1/strings/0x409/configuration
+echo "Config 1: ACM+MSD gadget" > configs/c.1/strings/0x409/configuration
 echo 250 > configs/c.1/MaxPower
 id=0
 for dev in mmcblk0 nvme0n1 sda sdb sdc sdd; do
@@ -57,6 +57,8 @@ for dev in mmcblk0 nvme0n1 sda sdb sdc sdd; do
       id=$((id + 1))
    fi
 done
+mkdir -p functions/acm.usb0
+ln -s functions/acm.usb0 configs/c.1/
 
 count=0
 while [ ${count} -lt 15 ]; do
@@ -70,4 +72,5 @@ while [ ${count} -lt 15 ]; do
    sleep 1
 done
 
+systemctl restart serial-getty@ttyGS0
 echo "Mass storage gadget init complete - $(cat UDC)"
