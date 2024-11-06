@@ -1,0 +1,11 @@
+[all]
+kernel=kernel8.img
+initramfs rootfs.cpio.zst
+enable_uart=1
+uart_2ndstage=1
+
+[pi500]
+# Pull RP2040 RUN low to prevent invalid firmware
+# causing issues during bootup of the keyboard firmware update.
+gpio=121=op,dl
+

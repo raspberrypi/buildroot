@@ -1,0 +1,79 @@
+#!/bin/sh
+
+bootsel_gpio=118
+run_gpio=121
+
+rp2040_reset() {
+   pinctrl set $run_gpio op dl
+   pinctrl set $run_gpio op dh
+}
+
+rp2040_reboot_bootsel() {
+   echo "Switching RP2040 to BOOTSEL mod"
+   pinctrl set $bootsel_gpio op dh
+   rp2040_reset
+   sleep 2
+   pinctrl set $bootsel_gpio op dl
+}
+
+die() {
+   echo "$@" >&2
+   exit 1
+}
+
+rp2040_load_uf2_to_ram() {
+   uf2="$1"
+   [ -f "${uf2}" ] || die "Keyboard firmware image \"${uf2}\" not found"
+   echo "Flashing RP2040"
+   rp2040_reboot_bootsel
+   picotool load "${uf2}" --vid 0x2e8a --pid 0x0003 --verify --execute
+}
+
+rp2040_load_uf2_to_flash() {
+   uf2="$1"
+   [ -f "${uf2}" ] || die "Keyboard firmware image \"${uf2}\" not found"
+   echo "Flashing RP2040"
+   rp2040_reboot_bootsel
+   picotool load "${uf2}" --vid 0x2e8a --pid 0x0003 --verify
+   sleep 1
+   picotool reboot --vid 0x2e8a --pid 0x0003
+}
+
+if [ -e /dev/mmcblk0p1 ]; then
+   # Restored recovery.bin so that this image can be run again
+   mkdir -p /tmp/boot
+   mount /dev/mmcblk0p1 /tmp/boot
+   rm -f /boot/RECOVERY.* /tmp/boot/recovery.*
+   cp -f /root/recovery.bin /tmp/boot
+   sync umount /tmp/boot
+fi
+
+BOARD_TYPE_CODE=$(grep Revision /proc/cpuinfo | awk '{print $3}' | cut -c4-5)
+if [ "${BOARD_TYPE_CODE}" != 19 ]; then
+   TERM=linux whiptail \
+   --title "Raspberry Pi500 Keyboard Firmware Update" \
+   --infobox "Pi500 board revision not detected: Expected 19 actual ${BOARD_TYPE_CODE}. Exiting." 10 150
+   exit 1
+fi
+
+echo "Updating Pi500 Keyboard Firmware"
+
+# firmware to use
+kb_fw=/root/keyboard/keyboard-fw.uf2
+nuke_fw=/root/keyboard/flash_nuke.uf2
+
+# If no parameters specified, just flash the keyboard
+param=${1-flash}
+if [ "$param" = "flash" ]; then
+   rp2040_load_uf2_to_flash "$kb_fw"
+elif [ "$param" = "wipe" ]; then
+   rp2040_load_uf2_to_ram "$nuke_fw"
+else
+   rp2040_load_uf2_to_flash "$param"
+fi
+
+clear
+TERM=linux whiptail \
+   --title "Raspberry Pi500 Keyboard Firmware Update" \
+   --infobox "Keyboard firmware updated. Please eject the SD card and reboot." 10 150
+sleep 6000
