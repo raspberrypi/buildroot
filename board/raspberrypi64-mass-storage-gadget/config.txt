@@ -11,8 +11,11 @@ fixup_file=fixup4.dat
 [pi5]
 # Limit clock frequencies because this is likely to be powered 
 # via USB-3 port
-arm_freq=1000
+arm_freq=500
 gpu_freq=500
+
+# Probe the PCIe x1 connector even if DET_WAKE is low
+dtparam=pciex1
 
 [none]
 
