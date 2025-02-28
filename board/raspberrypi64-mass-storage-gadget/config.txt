@@ -17,5 +17,3 @@ gpu_freq=500
 # Probe the PCIe x1 connector even if DET_WAKE is low
 dtparam=pciex1
 
-[none]
-
