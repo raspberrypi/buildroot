@@ -13,8 +13,9 @@ fi
 
 # Disable activity LED, otherwise eMMC will be disabled on CM3
 if grep -q 2837 /proc/device-tree/compatible; then
-   vcmailbox 0x00038043 20 4 129 1 0 0 1 || true
-   sleep 3
+   echo none > /sys/class/leds/ACT/trigger
+   echo 0 > /sys/class/leds/ACT/brightness
+   sleep 1
 fi
 
 if lspci | grep -iq "USB Controller"; then
