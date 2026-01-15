@@ -1,0 +1,10 @@
+[Unit]
+Description=Mass storage gadget
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/configure-gadgets
+StandardOutput=journal+console
+
+[Install]
+WantedBy=sysinit.target

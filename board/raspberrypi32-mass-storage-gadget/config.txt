@@ -1,0 +1,14 @@
+[all]
+initramfs rootfs.cpio.zst
+enable_uart=1
+#uart_2ndstage=1
+disable_overscan=1
+dtoverlay=dwc2,dr_mode=peripheral
+start_file=start4cd.elf
+fixup_file=fixup4cd.dat
+gpu_mem=16
+kernel=zImage
+force_turbo=1
+dtoverlay=vc4-kms-v3d
+max_framebuffers=0
+disable_splash=1
