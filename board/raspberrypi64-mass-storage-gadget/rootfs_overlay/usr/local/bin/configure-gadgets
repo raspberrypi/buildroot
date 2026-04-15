@@ -18,12 +18,29 @@ if grep -q 2837 /proc/device-tree/compatible; then
    sleep 1
 fi
 
-if lspci | grep -iq "USB Controller"; then
-   # For slow to init drives it might be better to use udev events
-   # However, that's unecessary complexity for a rare use-case
-   # right now.
-   echo "Detected USB Controller - delaying for drive init"
+if ls /sys/bus/usb/devices/usb* > /dev/null 2>&1; then
+   echo "Detected USB Controller - waiting for drive enumeration"
    sleep 5
+   udevadm settle --timeout=30
+fi
+
+# Wait until at least one storage device has appeared.  If enumeration was
+# slow or a device was plugged in slightly late this loop catches it.  After
+# the timeout we proceed anyway so that the ACM serial console becomes
+# available for debugging.
+MSD_TIMEOUT=30
+count=0
+while [ ${count} -lt ${MSD_TIMEOUT} ]; do
+   for dev in mmcblk0 nvme0n1 sda sdb sdc sdd; do
+      [ -e /dev/${dev} ] && break 2
+   done
+   echo "Waiting for storage device... (${count}s)"
+   count=$((count + 1))
+   sleep 1
+done
+
+if [ ${count} -lt ${MSD_TIMEOUT} ]; then
+   echo "Storage device found after ${count}s"
 fi
 
 mkdir -p "${CONFIGFS}"
@@ -60,6 +77,9 @@ for dev in mmcblk0 nvme0n1 sda sdb sdc sdd; do
 done
 mkdir -p functions/acm.usb0
 ln -s functions/acm.usb0 configs/c.1/
+if [ ${id} -eq 0 ]; then
+   echo "No storage devices found, proceeding with ACM only"
+fi
 
 count=0
 while [ ${count} -lt 15 ]; do
