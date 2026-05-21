@@ -24,7 +24,7 @@ if [ -f ${BINARIES_DIR}/Image ]; then
    mv ${BINARIES_DIR}/Image.gz ${BINARIES_DIR}/kernel8.img
 fi
 
-KERNEL_VERSION=linux-rpi-6.12.y
+KERNEL_VERSION=linux-rpi-6.18.y
 # Hack: Prefer the kernel overlays to the rpi-firmware versions
 rm -f ${BINARIES_DIR}/*.dtb
 cp -fv "${BINARIES_DIR}/../build/${KERNEL_VERSION}/arch/arm64/boot/dts/broadcom/"*.dtb "${BINARIES_DIR}"
