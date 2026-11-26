@@ -1,0 +1,8 @@
+config BR2_PACKAGE_RPI_BOOTLOADER_VERSION
+	bool "rpi-bootloader-version"
+	depends on BR2_arm || BR2_aarch64
+	help
+	  Displays the version of the running Raspberry Pi bootloader,
+	  as reported via device-tree, or of an EEPROM image.
+
+	  https://github.com/raspberrypi/rpi-eeprom
