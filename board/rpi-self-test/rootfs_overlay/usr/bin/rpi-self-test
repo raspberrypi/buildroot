@@ -1,0 +1,1255 @@
+#!/bin/bash
+#
+# Raspberry Pi self-test
+#
+# Displays a one screen hardware report on HDMI, redrawn in place so that it
+# can be photographed, and logs the same information as plain text on the UART.
+#
+# The inventory (board, OTP, storage, PCIe, USB, displays) is collected and
+# logged to the UART, with the EEPROM config, kernel errors and firmware log,
+# before any hardware is exercised. The tests then run in order of increasing
+# duration: storage read, Ethernet and finally the memory test. Each result
+# is logged to the UART as it completes and the report is logged again at the
+# end.
+#
+# The report is strictly read-only: storage devices are identified from their
+# registers and read speed is measured by discarding the data that is read,
+# nothing is mounted and no file-system or user data is displayed.
+
+PING_HOST="${PING_HOST:-www.google.com}"
+LINK_TIMEOUT=10
+DHCP_TIMEOUT=20
+WIRELESS_TIMEOUT=12
+MMC_READ_MB=64
+HDMI_REFRESH=2
+# 1080p with the 16x32 font is 120x33 characters
+WIDTH=118
+LABEL_WIDTH=13
+
+DT=/proc/device-tree
+RUN_DIR=/run/rpi-self-test
+MEMTEST_LOG=${RUN_DIR}/memtester.log
+
+# Status text which marks a line as an issue. These are always upper case.
+FAIL_RE='NO (LINK|DHCP LEASE|REPLY|EDID|INTERFACE|DISPLAY DRIVER)|NOT (DETECTED|LOADED|FOUND|READABLE|RUN)|READ ERROR|MISMATCH|CORRUPT|FAILED|UNDER-VOLTAGE|EXCEEDED|WARNING|URGENT|[0-9] ERRORS|ERROR '
+# Prefix of a lower priority line, see detail()
+DETAIL='~'
+
+# Sections of the report. S_ sections are filled in as the inventory and
+# tests complete, L_ sections are live and read on every refresh.
+S_BOARD=""
+S_SUPPLY=""
+S_STORAGE=""
+S_PCIE=""
+S_USB=""
+S_NET=""
+S_WIFI=""
+S_BT=""
+L_CPU=""
+L_KERNEL=""
+L_POWER=""
+L_DISPLAY=""
+REPORT=""
+ISSUES=""
+PHASE="collecting the inventory"
+TICK=0
+
+MEMTEST_PID=""
+MEMTEST_MB=0
+MEMTEST_START=0
+MEMTEST_STATUS="waiting for the other tests"
+CHIP=""
+STEPPING=""
+BOARD_TYPE=0
+OTP=()
+EEPROM_CONFIG=""
+AVS=""
+CPU_STATIC=""
+CPU_RANGE=""
+KERNEL_RELEASE=""
+WIFI_FITTED=""
+ETH_FITTED=""
+ETH_IFC=""
+
+dtString() {
+	[ -f "$1" ] && tr -d '\0' < "$1"
+}
+
+dtHex() {
+	[ -f "$1" ] && od -An -v -t x1 "$1" | tr -d ' \n'
+}
+
+# A device-tree cell (big-endian 32-bit) as a decimal number. $2 is the
+# index of the cell.
+dtU32() {
+	local hex
+	hex="$(dtHex "$1")"
+	hex="${hex:$(( ${2:-0} * 8 )):8}"
+	[ ${#hex} -eq 8 ] && echo $((0x${hex}))
+}
+
+popcount() {
+	local v=$(( $1 )) n=0
+	while [ ${v} -ne 0 ]; do
+		n=$((n + (v & 1)))
+		v=$((v >> 1))
+	done
+	echo ${n}
+}
+
+# One report line: label + value. Control characters are removed because
+# some values come from devices e.g. the SD card name or USB product string.
+# Fields within the value are separated by two spaces, which are widened.
+line() {
+	local value="${2//[^[:print:]]/}" text
+	value="${value//  /   }"
+	printf -v text "%-${LABEL_WIDTH}s%s" "$1" "${value}"
+	printf '%s\n' "${text:0:${WIDTH}}"
+}
+
+# A lower priority line. These are the first to be left off the HDMI report
+# if it does not fit on the screen. They are always logged on the UART.
+detail() {
+	printf '%s' "${DETAIL}"
+	line "$@"
+}
+
+elapsed() {
+	local s=$(( $1 ))
+	printf '%d:%02d' $((s / 60)) $((s % 60))
+}
+
+################################################################################
+# Board, SDRAM, firmware
+
+memsizeName() {
+	case "$1" in
+		[01]) echo "$((256 << $1))MB" ;;
+		[2-6]) echo "$((1 << ($1 - 2)))GB" ;;
+		*) echo "other" ;;
+	esac
+}
+
+# SDRAM_CONFIG decode, as rpi-manufacture-info in
+# https://github.com/raspberrypi/utils
+sdramSizeGbit() {
+	case $(($1 & 0x27)) in
+		7) echo 8 ;;
+		6) echo 16 ;;
+		38) echo 24 ;;
+		5) echo 32 ;;
+		4) echo 64 ;;
+		3) echo 128 ;;
+		*) echo 0 ;;
+	esac
+}
+
+gbitName() {
+	if [ $(($1 % 8)) -eq 0 ]; then
+		echo "$(($1 / 8))GB"
+	else
+		echo "$(($1 * 128))MB"
+	fi
+}
+
+# Board attributes (OTP row 33). The eMMC and Wi-Fi bits are only used on
+# Compute Modules and were not programmed on older devices.
+boardAttributes() {
+	local board_type=$1 emmc wifi
+
+	[ -n "${OTP33}" ] || { echo "OTP NOT READABLE"; return; }
+	echo -n "row 33 0x${OTP33}"
+	case "${board_type}" in
+		20|21|24|26) # CM4, CM4S, CM5, CM5 Lite
+			if [ $((0x${OTP33} & 0x80000000)) -ne 0 ] || [ "${board_type}" -eq 26 ]; then
+				emmc="Lite (no eMMC)"
+			else
+				emmc="eMMC fitted"
+			fi
+			echo -n "  ${emmc}"
+			if [ "${board_type}" -ne 21 ]; then
+				if [ $((0x${OTP33} & 0x40000000)) -ne 0 ]; then
+					wifi="no Wi-Fi"
+				else
+					wifi="Wi-Fi fitted"
+				fi
+				echo -n "  ${wifi}"
+			fi
+			;;
+	esac
+	echo
+}
+
+sdramInfo() {
+	local row cfg cfg1 gbit rank mem_field=$1
+
+	if [ "${CHIP}" = BCM2712 ]; then
+		row=${OTP34}
+		[ -n "${row}" ] || { echo "OTP NOT READABLE"; return; }
+		cfg=$((0x${row} & 0xfff))
+		cfg1=$(((0x${row} >> 16) & 0xfff))
+		[ ${cfg1} -eq 0 ] || cfg=${cfg1}
+	else
+		row=${OTP33}
+		[ -n "${row}" ] || { echo "OTP NOT READABLE"; return; }
+		cfg=$(((0x${row} >> 8) & 0x1ff))
+	fi
+	if [ ${cfg} -eq 0 ]; then
+		echo "SDRAM_CONFIG not programmed"
+		return
+	fi
+	gbit=$(sdramSizeGbit ${cfg})
+	if [ $(((cfg >> 4) & 1)) -eq 1 ]; then
+		rank="dual-rank"
+	else
+		rank="single-rank"
+	fi
+	if [ "${gbit}" -eq 0 ]; then
+		printf 'SDRAM_CONFIG 0x%03x unknown size, %s\n' ${cfg} "${rank}"
+	elif [ "$(gbitName ${gbit})" = "$(memsizeName ${mem_field})" ] ||
+	     { [ ${mem_field} -eq 7 ] && [ ${gbit} -eq 24 ]; }; then
+		printf '%s %s  SDRAM_CONFIG 0x%03x\n' "$(gbitName ${gbit})" "${rank}" ${cfg}
+	else
+		printf '%s %s  SDRAM_CONFIG 0x%03x  MISMATCH board revision %s\n' \
+			"$(gbitName ${gbit})" "${rank}" ${cfg} "$(memsizeName ${mem_field})"
+	fi
+}
+
+# Only the board attributes, SDRAM_CONFIG, customer key hash and anti-rollback
+# rows are kept from the OTP.
+otpWanted() {
+	case "${CHIP}:$1" in
+		BCM2712:33|BCM2712:34|BCM2712:3[7-9]|BCM2712:4[0-8]) return 0 ;;
+		BCM2711:33|BCM2711:4[7-9]|BCM2711:5[0-5]) return 0 ;;
+	esac
+	return 1
+}
+
+boardInfo() {
+	local rev revhex mem_field="" mem="" bl fw ids row val attrs part var crev
+	local cf=/sys/devices/system/cpu/cpu0/cpufreq
+
+	revhex="$(dtHex ${DT}/system/linux,revision)"
+	rev=$((0x${revhex:-0}))
+	[ -n "${revhex}" ] && revhex="$(printf '%x' ${rev})"
+	if [ $(( (rev >> 23) & 1 )) -eq 1 ]; then
+		mem_field=$(( (rev >> 20) & 7 ))
+		mem="  $(memsizeName ${mem_field})"
+	fi
+	case $(( (rev >> 12) & 0xf )) in
+		3) CHIP="BCM2711" ;;
+		4) CHIP="BCM2712" ;;
+	esac
+	BOARD_TYPE=$(( (rev >> 4) & 0xff ))
+
+	while IFS=: read -r row val; do
+		[[ "${row}" =~ ^[0-9]+$ ]] && [[ "${val}" =~ ^[0-9a-fA-F]{8}$ ]] || continue
+		row=$((10#${row}))
+		otpWanted ${row} && OTP[${row}]="${val}"
+	done <<< "$(vcgencmd otp_dump 2>/dev/null)"
+	OTP33="${OTP[33]}"
+	OTP34="${OTP[34]}"
+
+	# Board attributes (OTP row 33). Compute Modules record whether Wi-Fi
+	# is fitted and CM4S never has it.
+	attrs=$((0x${OTP33:-0}))
+	case ${BOARD_TYPE} in
+		21) WIFI_FITTED="not fitted" ;;
+		20|24|26) [ $((attrs & 0x40000000)) -ne 0 ] && WIFI_FITTED="not fitted (OTP)" ;;
+	esac
+	[ $((attrs & 0x10000000)) -ne 0 ] && ETH_FITTED="not fitted (OTP)"
+
+	socStepping
+	# Also printed on the UART.
+	EEPROM_CONFIG="$(vcgencmd bootloader_config 2>/dev/null)"
+	AVS="$(vcgencmd get_config over_voltage_avs 2>/dev/null)"
+	AVS="${AVS#*=}"
+	# Reported in hex, in uV.
+	[[ "${AVS}" =~ ^(0x[0-9a-fA-F]+|[0-9]+)$ ]] && AVS="$((AVS))uV"
+
+	# The parts of the live sections which do not change.
+	part="$(sed -n 's/^CPU part[[:space:]]*: //p' /proc/cpuinfo | head -n 1)"
+	var="$(sed -n 's/^CPU variant[[:space:]]*: //p' /proc/cpuinfo | head -n 1)"
+	crev="$(sed -n 's/^CPU revision[[:space:]]*: //p' /proc/cpuinfo | head -n 1)"
+	CPU_STATIC="$(cpuName "${part}") r$(( ${var:-0} ))p${crev:-?} x$(nproc)"
+	if [ -r ${cf}/scaling_min_freq ]; then
+		CPU_RANGE=" ($(( $(< ${cf}/scaling_min_freq) / 1000 ))-$(( $(< ${cf}/scaling_max_freq) / 1000 ))MHz)"
+	fi
+	KERNEL_RELEASE="$(uname -r)"
+	[ -f ${DT}/chosen/power/max_current ] && S_SUPPLY="$(supplyInfo)"
+
+	S_BOARD="$(
+		line "Model" "$(dtString ${DT}/model)"
+		line "Serial" "$(dtString ${DT}/serial-number)  Revision ${revhex:-unknown}${mem}  ${CHIP} ${STEPPING}"
+		ids="$(identity)"
+		[ -n "${ids}" ] && detail "Identity" "${ids}"
+		if [ -n "${mem_field}" ]; then
+			line "SDRAM" "$(sdramInfo ${mem_field})"
+		fi
+		detail "Board OTP" "$(boardAttributes ${BOARD_TYPE})"
+		line "Secure boot" "$(secureBoot)"
+		if bl=$(rpi-bootloader-version 2>/dev/null); then
+			line "Bootloader" "$(echo "${bl}" | sed -n 1p)  $(echo "${bl}" | sed -n 's/^version \([0-9a-f]\{12\}\).*/\1/p')"
+		else
+			line "Bootloader" "version not available"
+		fi
+		fw="$(vcgencmd version 2>/dev/null)"
+		fw="$(echo "${fw}" | sed -n '1s/ *$//p')  $(echo "${fw}" | sed -n 's/^version \([0-9a-f]\{8,\}\).*/\1/p')"
+		# On BCM2712 the firmware is the bootloader.
+		if [ "${CHIP}" = BCM2712 ]; then
+			detail "Firmware" "${fw}"
+		else
+			line "Firmware" "${fw}"
+		fi
+		line "Boot" "$(bootInfo)"
+	)"
+}
+
+# BCM2712 D0 is identified by the pinctrl compatible string, which the
+# firmware sets for D0, and BCM2711 C0 by the 3GB wide EMMC2 DMA range, which
+# the firmware sets for C0.
+socStepping() {
+	local path
+	STEPPING=""
+	if [ "${CHIP}" = BCM2712 ]; then
+		path="$(dtString ${DT}/__symbols__/pinctrl)"
+		if [ -n "${path}" ]; then
+			if dtString "${DT}${path}/compatible" | grep -q bcm2712d0; then
+				STEPPING="D0"
+			else
+				STEPPING="C1"
+			fi
+		fi
+	elif [ "${CHIP}" = BCM2711 ]; then
+		path="$(dtString ${DT}/__symbols__/emmc2bus)"
+		case "$(dtU32 "${DT}${path}/dma-ranges" 4)" in
+			$((0xfc000000))) STEPPING="C0" ;;
+			$((0x40000000))) STEPPING="B0" ;;
+		esac
+	fi
+}
+
+# 64-bit serial number and, on BCM2712, the device unique ID.
+identity() {
+	local s64 duid
+	s64="$(dtString ${DT}/chosen/rpi-serial64)"
+	duid="$(dtString ${DT}/chosen/rpi-duid)"
+	echo "${s64:+serial64 ${s64}}${duid:+  DUID ${duid}}"
+}
+
+# SHA256 of the customer public key, in the same byte order as sha256sum,
+# and the bootloader anti-rollback (ARB) version, which is a thermometer code.
+# BCM2711: hash in rows 47-54, ARB in the top byte of row 55.
+# BCM2712: hash in rows 37-44, ARB in rows 45-48.
+secureBoot() {
+	local first i hash="" arb=0 signed
+	if [ "${CHIP}" = BCM2712 ]; then
+		first=37
+	else
+		first=47
+	fi
+	for i in $(seq ${first} $((first + 7))); do
+		[ -n "${OTP[i]}" ] || { echo "OTP NOT READABLE"; return; }
+		hash+="${OTP[i]:6:2}${OTP[i]:4:2}${OTP[i]:2:2}${OTP[i]:0:2}"
+	done
+	if [ "${CHIP}" = BCM2712 ]; then
+		for i in 45 46 47 48; do
+			arb=$((arb + $(popcount 0x${OTP[i]:-0})))
+		done
+	else
+		arb=$(popcount $(( (0x${OTP[55]:-0} >> 24) & 0xff )))
+	fi
+	[ -n "${hash//0/}" ] || hash="none"
+	signed="$(dtU32 ${DT}/chosen/bootloader/signed)"
+	printf 'key %s  ARB %d  signed 0x%x\n' "${hash}" ${arb} ${signed:-0}
+}
+
+bootModeName() {
+	case "$1" in
+		1) echo "SD" ;;
+		2) echo "NETWORK" ;;
+		3) echo "RPIBOOT" ;;
+		4) echo "USB-MSD" ;;
+		5) echo "BCM-USB-MSD" ;;
+		6) echo "NVMe" ;;
+		7) echo "HTTP" ;;
+		*) echo "$1" ;;
+	esac
+}
+
+bootInfo() {
+	local order mode part tryboot rsts
+	order="$(echo "${EEPROM_CONFIG}" | sed -n 's/^BOOT_ORDER=\(0x[0-9a-fA-F]*\).*/\1/p' | tail -n 1)"
+	mode="$(dtU32 ${DT}/chosen/bootloader/boot-mode)"
+	part="$(dtU32 ${DT}/chosen/bootloader/partition)"
+	tryboot="$(dtU32 ${DT}/chosen/bootloader/tryboot)"
+	rsts="$(dtU32 ${DT}/chosen/bootloader/rsts)"
+	echo -n "BOOT_ORDER ${order:-default}"
+	[ -n "${mode}" ] && echo -n "  mode $(bootModeName ${mode})"
+	[ -n "${part}" ] && echo -n "  partition ${part}"
+	[ -n "${tryboot}" ] && echo -n "  tryboot ${tryboot}"
+	[ -n "${rsts}" ] && printf '  rsts 0x%x' ${rsts}
+	echo
+}
+
+################################################################################
+# CPU core, revision, clocks and temperature. Read on every refresh.
+
+cpuName() {
+	case "$1" in
+		0xd08) echo "Cortex-A72" ;;
+		0xd0b) echo "Cortex-A76" ;;
+		*) echo "part $1" ;;
+	esac
+}
+
+# Sets REPLY from the output of vcgencmd measure_clock
+clockMhz() {
+	if [[ "$1" =~ =([0-9]+)$ ]]; then
+		REPLY="$(( BASH_REMATCH[1] / 1000000 ))MHz"
+	else
+		REPLY="?"
+	fi
+}
+
+cpuInfo() {
+	local arm core t=""
+
+	clockMhz "$(vcgencmd measure_clock arm 2>/dev/null)"
+	arm="${REPLY}"
+	clockMhz "$(vcgencmd measure_clock core 2>/dev/null)"
+	core="${REPLY}"
+	read -r t 2>/dev/null < /sys/class/thermal/thermal_zone0/temp
+	[[ "${t}" =~ ^[0-9]+$ ]] || t=0
+	line "CPU" "${CPU_STATIC}  arm ${arm}${CPU_RANGE}  core ${core}  $((t / 1000)).$(( (t % 1000) / 100 ))C"
+}
+
+################################################################################
+# Voltages and throttling, read on every refresh. The power supply limits
+# do not change so they are read once.
+
+# Sets REPLY to the voltage which follows the name $1 in the vcgencmd
+# output $2 e.g. "EXT5V_V volt(24)=5.03V" or "volt=0.8900V"
+volts() {
+	if [[ "$2" =~ $1[^=]*=([0-9.]+)V ]]; then
+		printf -v REPLY '%.2fV' "${BASH_REMATCH[1]}" 2>/dev/null
+	else
+		REPLY="?"
+	fi
+}
+
+# The status is first so that it is never cut off the end of the line.
+throttledText() {
+	local t now="" past=""
+
+	[[ "$1" =~ ^0x[0-9a-fA-F]+$ ]] || { echo "throttled ?"; return; }
+	t=$(( $1 ))
+	[ $((t & 0x1)) -ne 0 ] && now+=" UNDER-VOLTAGE"
+	[ $((t & 0x2)) -ne 0 ] && now+=" freq-capped"
+	[ $((t & 0x4)) -ne 0 ] && now+=" throttled"
+	[ $((t & 0x8)) -ne 0 ] && now+=" temp-limit"
+	[ $((t & 0x10000)) -ne 0 ] && past+=" UNDER-VOLTAGE"
+	[ $((t & 0x20000)) -ne 0 ] && past+=" freq-capped"
+	[ $((t & 0x40000)) -ne 0 ] && past+=" throttled"
+	[ $((t & 0x80000)) -ne 0 ] && past+=" temp-limit"
+	if [ ${t} -eq 0 ]; then
+		echo "not throttled"
+	else
+		echo "${now:+now:${now}}${now:+${past:+ }}${past:+since boot:${past}}"
+	fi
+}
+
+# USB-PD fixed supply PDO: voltage in 50mV and maximum current in 10mA
+# units. Other PDO types are shown in hex.
+pdoText() {
+	local p=$(( $1 ))
+	[ ${p} -ne 0 ] || return
+	if [ $(( (p >> 30) & 3 )) -eq 0 ]; then
+		printf ' %d.%dV/%d.%02dA' $(( ((p >> 10) & 0x3ff) / 20 )) $(( ((p >> 10) & 0x3ff) % 20 / 2 )) \
+			$(( (p & 0x3ff) / 100 )) $(( (p & 0x3ff) % 100 ))
+	else
+		printf ' 0x%08x' ${p}
+	fi
+}
+
+# BCM2712 only: the power supply as detected by the bootloader. The first
+# line is added to the supply voltage and the second is the USB-PD line.
+supplyInfo() {
+	local d=${DT}/chosen/power i pdos="" v
+	for i in 0 1 2 3 4 5 6; do
+		v="$(dtU32 ${d}/usbpd_power_data_objects ${i})"
+		[ -n "${v}" ] && pdos+="$(pdoText ${v})"
+	done
+	v="$(dtU32 ${d}/power_reset)"
+	echo "max_current $(dtU32 ${d}/max_current)mA  usb_max_current_enable $(dtU32 ${d}/usb_max_current_enable)  usb_over_current $(dtU32 ${d}/usb_over_current_detected)  power_reset $(printf '0x%x' ${v:-0})"
+	pdos="${pdos# }"
+	echo "${pdos:-none}"
+}
+
+# On BCM2712 the supply voltage (EXT5V) and the rails are measured by the
+# PMIC.
+powerInfo() {
+	local p th v="" supply=""
+
+	th="$(vcgencmd get_throttled 2>/dev/null)"
+	th="$(throttledText "${th#*=}")"
+	if [ "${CHIP}" = BCM2712 ]; then
+		p="$(vcgencmd pmic_read_adc 2>/dev/null)"
+		volts EXT5V_V "${p}"
+		supply="${REPLY}"
+		volts VDD_CORE_V "${p}"
+		v+="Core ${REPLY}"
+		volts DDR_VDD2_V "${p}"
+		v+="  DDR VDD2 ${REPLY}"
+		volts DDR_VDDQ_V "${p}"
+		v+=" VDDQ ${REPLY}"
+	else
+		volts volt "$(vcgencmd measure_volts core 2>/dev/null)"
+		v+="Core ${REPLY}"
+		volts volt "$(vcgencmd measure_volts sdram_c 2>/dev/null)"
+		v+="  SDRAM C ${REPLY}"
+		volts volt "$(vcgencmd measure_volts sdram_i 2>/dev/null)"
+		v+=" I ${REPLY}"
+		volts volt "$(vcgencmd measure_volts sdram_p 2>/dev/null)"
+		v+=" P ${REPLY}"
+	fi
+	line "Power" "${th}  ${v}  over_voltage_avs ${AVS:-?}"
+	if [ "${CHIP}" = BCM2712 ]; then
+		line "Supply" "${supply}  ${S_SUPPLY%%$'\n'*}"
+		[ -n "${S_SUPPLY}" ] && detail "USB-PD" "${S_SUPPLY#*$'\n'}"
+	fi
+}
+
+################################################################################
+# eMMC / SD
+
+mmcLifeTime() {
+	case "$1" in
+		0x0b) echo "EXCEEDED" ;;
+		0x0[1-9]|0x0a)
+			local n=$(( $1 ))
+			echo "$(( (n - 1) * 10 ))-$(( n * 10 ))%" ;;
+		*) echo "n/a" ;;
+	esac
+}
+
+mmcPreEol() {
+	case "$1" in
+		0x01) echo "normal" ;;
+		0x02) echo "WARNING" ;;
+		0x03) echo "URGENT" ;;
+		*) echo "n/a" ;;
+	esac
+}
+
+mmcManufacturer() {
+	local name=""
+	case "$1" in
+		0x000011) name="Kioxia " ;;
+		0x000013|0x0000fe) name="Micron " ;;
+		0x000015) name="Samsung " ;;
+		0x000045) name="SanDisk " ;;
+		0x000070) name="Kingston " ;;
+		0x000090) name="SK hynix " ;;
+	esac
+	echo "${name}$(printf '0x%02x' $(( $1 )))"
+}
+
+# The eMMC CID year field is 4 bits wide. The kernel cannot tell 2010-2012
+# from 2026-2028 so show both.
+mmcDate() {
+	local month="${1%/*}" year="${1#*/}"
+	if [ "$2" = "MMC" ] && [ "${year}" -ge 2010 ] 2>/dev/null && [ "${year}" -le 2012 ]; then
+		echo "${month}/${year} or ${month}/$((year + 16))"
+	else
+		echo "$1"
+	fi
+}
+
+sizeName() {
+	local mb=$(( $1 / 2048 ))
+	if [ ${mb} -ge 1024 ]; then
+		echo "$((mb / 1024)).$(( (mb % 1024) * 10 / 1024 ))GB"
+	else
+		echo "${mb}MB"
+	fi
+}
+
+# Partition table type and partition sizes / file-system types as probed by
+# udev. Nothing is mounted and no file-system contents are read.
+udevProperty() {
+	sed -n "s/^E:$2=//p" "/run/udev/data/b$(cat "$1/dev")" 2>/dev/null
+}
+
+partitionInfo() {
+	local blk="$1" p table out=""
+
+	table="$(udevProperty "${blk}" ID_PART_TABLE_TYPE)"
+	for p in "${blk}/$(basename "${blk}")"p[0-9]*; do
+		out+="  p$(cat "${p}/partition") $(sizeName $(cat "${p}/size")) $(udevProperty "${p}" ID_FS_TYPE)"
+	done
+	if [ -z "${out}" ]; then
+		echo "none"
+	else
+		echo "${table:-unknown}${out}"
+	fi
+}
+
+# $1 is "test" to measure the read speed, otherwise only the identity of
+# each device is read.
+mmcInfo() {
+	local test="$1" blk out="" found=0
+
+	for blk in /sys/block/mmcblk[0-9]*; do
+		[ -d "${blk}/device" ] || continue
+		case "${blk}" in
+			*boot[0-9]|*rpmb) continue ;;
+		esac
+		found=1
+
+		local d="${blk}/device" dev type label manf size host ios bus="" start ms speed
+		dev="$(basename "${blk}")"
+		type="$(cat "${d}/type" 2>/dev/null)"
+		size=$(( $(cat "${blk}/size") / 2048 ))
+		if [ "${type}" = "MMC" ]; then
+			label="eMMC"
+			manf="$(mmcManufacturer "$(cat "${d}/manfid")")"
+		else
+			label="SD"
+			manf="$(printf '0x%02x' $(( $(cat "${d}/manfid") )))"
+		fi
+
+		host="$(basename "$(readlink -f "${d}/..")")"
+		ios="/sys/kernel/debug/${host}/ios"
+		if [ -f "${ios}" ]; then
+			local timing width clock
+			timing="$(sed -n 's/^timing spec:[[:space:]]*[0-9]* (\(.*\))/\1/p' "${ios}")"
+			width="$(sed -n 's/^bus width:[[:space:]]*[0-9]* (\([0-9]*\) bits)/\1/p' "${ios}")"
+			clock="$(sed -n 's/^clock:[[:space:]]*\([0-9]*\) Hz/\1/p' "${ios}")"
+			bus="${timing#mmc } ${width}-bit $(( ${clock:-0} / 1000000 ))MHz  "
+		fi
+
+		start=${EPOCHREALTIME/./}
+		if [ "${test}" != test ]; then
+			speed="read test pending"
+		elif dd if="/dev/${dev}" of=/dev/null bs=1M count=${MMC_READ_MB} iflag=direct 2>/dev/null; then
+			ms=$(( (${EPOCHREALTIME/./} - start) / 1000 ))
+			[ ${ms} -gt 0 ] || ms=1
+			speed="read $(( MMC_READ_MB * 1000 / ms ))MB/s"
+		else
+			speed="READ ERROR"
+		fi
+
+		out+="$(line "${label}" "${manf} $(cat "${d}/name")  $((size / 1024)).$(( (size % 1024) * 10 / 1024 ))GiB  $(mmcDate "$(cat "${d}/date")" "${type}")  fw $(cat "${d}/fwrev")")"$'\n'
+		if [ -f "${d}/life_time" ]; then
+			set -- $(cat "${d}/life_time")
+			out+="$(line "" "${speed}  ${bus}Life A $(mmcLifeTime "$1") B $(mmcLifeTime "$2")  Pre-EOL $(mmcPreEol "$(cat "${d}/pre_eol_info")")")"$'\n'
+		else
+			out+="$(line "" "${speed}  ${bus}")"$'\n'
+		fi
+		out+="$(detail "Partitions" "$(partitionInfo "${blk}")")"$'\n'
+	done
+	[ ${found} -eq 1 ] || out="$(line "eMMC/SD" "none found")"
+	S_STORAGE="${out%$'\n'}"
+}
+
+################################################################################
+# PCIe and USB: devices only, bridges and hubs are not listed.
+
+pcieGen() {
+	case "$1" in
+		2.5*) echo "Gen1" ;;
+		5.0*) echo "Gen2" ;;
+		8.0*) echo "Gen3" ;;
+		16.0*) echo "Gen4" ;;
+		*) echo "$1" ;;
+	esac
+}
+
+pcieInfo() {
+	local d out="" class id name n=0
+
+	for d in /sys/bus/pci/devices/*; do
+		[ -d "${d}" ] || continue
+		class="$(cat "${d}/class")"
+		case "${class}" in
+			0x0604*) continue ;;
+		esac
+		id="$(cat "${d}/vendor"):$(cat "${d}/device")"
+		id="${id//0x/}"
+		case "${id}" in
+			1de4:0001) name="RP1" ;;
+			1106:3483) name="VL805 USB" ;;
+			*)
+				case "${class}" in
+					0x0108*) name="NVMe $(cat "${d}"/nvme/nvme*/model < /dev/null 2>/dev/null | head -n 1 | tr -s ' ' | sed 's/ *$//')" ;;
+					0x0c03*) name="USB" ;;
+					0x02*) name="Network" ;;
+					*) name="class ${class}" ;;
+				esac ;;
+		esac
+		out+="$(line "$([ ${n} -eq 0 ] && echo PCIe)" "$(basename "${d}") ${id} ${name}  $(pcieGen "$(cat "${d}/current_link_speed" 2>/dev/null)") x$(cat "${d}/current_link_width" 2>/dev/null)")"$'\n'
+		n=$((n + 1))
+	done
+	[ ${n} -gt 0 ] || out="$(line "PCIe" "no devices")"
+	S_PCIE="${out%$'\n'}"
+}
+
+usbInfo() {
+	local d out="" n=0 buses=(/sys/bus/usb/devices/usb*) text
+
+	for d in /sys/bus/usb/devices/[0-9]*; do
+		case "$(basename "${d}")" in
+			*:*) continue ;;
+		esac
+		[ "$(cat "${d}/bDeviceClass" 2>/dev/null)" = "09" ] && continue
+		n=$((n + 1))
+		[ ${n} -le 8 ] || continue
+		text="$(basename "${d}") $(cat "${d}/idVendor"):$(cat "${d}/idProduct") $(cat "${d}/product" 2>/dev/null) $(cat "${d}/speed")M"
+		# Only the first device is always shown on HDMI.
+		if [ ${n} -eq 1 ]; then
+			out+="$(line "" "${text}")"$'\n'
+		else
+			out+="$(detail "" "${text}")"$'\n'
+		fi
+	done
+	S_USB="$(line "USB" "buses ${#buses[@]}  devices ${n} (excluding hubs)")"
+	[ -n "${out}" ] && S_USB+=$'\n'"${out%$'\n'}"
+}
+
+################################################################################
+# Wi-Fi and Bluetooth: chip, firmware version and whether the firmware loaded.
+# The interfaces are not configured or brought up.
+
+wlanInterface() {
+	local i
+	for i in /sys/class/net/*; do
+		[ -d "${i}/wireless" ] && { basename "${i}"; return; }
+	done
+}
+
+# The drivers are not loaded automatically (see /etc/modprobe.d) so that a
+# board without Wi-Fi / Bluetooth does not log probe errors. The firmware is
+# loaded asynchronously so wait for the Wi-Fi interface and for the Bluetooth
+# patch, which logs the build number before and after it is loaded.
+wirelessLoad() {
+	local i log
+
+	[ -z "${WIFI_FITTED}" ] || return
+	modprobe -a brcmfmac hci_uart 2>/dev/null
+	for i in $(seq $((WIRELESS_TIMEOUT * 2))); do
+		if [ -n "$(wlanInterface)" ]; then
+			log="$(dmesg | grep '\] Bluetooth: hci0: BCM')"
+			[ "$(echo "${log}" | grep -c ' build ')" -ge 2 ] && break
+			echo "${log}" | grep -q 'Patch.*not found' && break
+		fi
+		sleep 0.5
+	done
+}
+
+# The kernel messages are matched from the start of the line so that text
+# from a device, e.g. a product name, cannot imitate them.
+wirelessInfo() {
+	local log i ifc sdio="" fw chip patch build
+
+	if [ -n "${WIFI_FITTED}" ]; then
+		S_WIFI="$(line "Wi-Fi" "${WIFI_FITTED}")"
+		S_BT="$(line "Bluetooth" "${WIFI_FITTED}")"
+		return
+	fi
+
+	log="$(dmesg 2>/dev/null)"
+	for i in /sys/bus/sdio/devices/*; do
+		sdio="$(cat "${i}/vendor"):$(cat "${i}/device")"
+		sdio="${sdio//0x/}"
+		break
+	done
+	ifc="$(wlanInterface)"
+	fw="$(echo "${log}" | sed -n 's/^\[[ 0-9.]*\] brcmfmac: brcmf_c_preinit_dcmds: Firmware: \([^ ]*\) .* version \([^ ]*\) .*/\1  version \2/p' | tail -n 1)"
+	if [ -n "${ifc}" ]; then
+		S_WIFI="$(line "Wi-Fi" "firmware loaded  ${ifc} $(cat /sys/class/net/${ifc}/address)  ${fw:-firmware version unknown}  SDIO ${sdio:-?}")"
+	elif [ -n "${sdio}" ]; then
+		S_WIFI="$(line "Wi-Fi" "FIRMWARE NOT LOADED  SDIO ${sdio}")"
+	else
+		S_WIFI="$(line "Wi-Fi" "NOT DETECTED")"
+	fi
+
+	if [ -d /sys/class/bluetooth/hci0 ]; then
+		chip="$(echo "${log}" | sed -n 's/^\[[ 0-9.]*\] Bluetooth: hci0: \(BCM[0-9A-Z]*\) .*Patch.*/\1/p' | tail -n 1)"
+		build="$(echo "${log}" | sed -n 's/^\[[ 0-9.]*\] Bluetooth: hci0: BCM[0-9A-Z]* .*build \([0-9]*\).*/\1/p' | tail -n 1)"
+		if echo "${log}" | grep -q '^\[[ 0-9.]*\] Bluetooth: hci0: BCM.*Patch.*not found'; then
+			patch="PATCH NOT FOUND"
+		elif echo "${log}" | grep -q '^\[[ 0-9.]*\] Bluetooth: hci0: BCM.*Patch'; then
+			patch="patch loaded"
+		else
+			patch="$(echo "${log}" | sed -n 's/^\[[ 0-9.]*\] Bluetooth: hci0: //p' | tail -n 1)"
+			patch="${patch:-no kernel messages}"
+		fi
+		S_BT="$(line "Bluetooth" "${patch}  hci0  ${chip:-chip unknown}${build:+  build ${build}}")"
+	else
+		S_BT="$(line "Bluetooth" "NOT DETECTED")"
+	fi
+}
+
+################################################################################
+# HDMI: hot-plug status, monitor and native mode from the KMS driver's EDID.
+# Read on every refresh so that a monitor can be plugged in later.
+
+# Decoded without forking because it runs on every refresh. $1 is a byte.
+edidChar() {
+	local h
+	printf -v h '%x' "$1"
+	printf -v EDID_CHAR "\\x${h}"
+}
+
+edidInfo() {
+	local b i o sum=0 bad=0 v name="" mfr="" native=""
+
+	b=($(od -An -v -t u1 "$1" 2>/dev/null))
+	if [ ${#b[@]} -lt 128 ]; then
+		echo "NO EDID"
+		return
+	fi
+	# Every 128 byte block has a checksum
+	for ((i = 0; i < ${#b[@]}; i++)); do
+		sum=$((sum + b[i]))
+		if [ $((i % 128)) -eq 127 ]; then
+			[ $((sum % 256)) -eq 0 ] || bad=1
+			sum=0
+		fi
+	done
+	# Monitor name descriptor
+	for o in 54 72 90 108; do
+		[ $((b[o] | b[o + 1] | b[o + 2])) -eq 0 ] && [ ${b[o + 3]} -eq 252 ] || continue
+		for ((i = o + 5; i < o + 18 && b[i] != 10; i++)); do
+			edidChar ${b[i]}
+			name+="${EDID_CHAR}"
+		done
+	done
+	v=$(( (b[8] << 8) | b[9] ))
+	for i in 10 5 0; do
+		edidChar $((64 + ((v >> i) & 31)))
+		mfr+="${EDID_CHAR}"
+	done
+	name="${name%"${name##*[! ]}"}"
+	# The first detailed timing is the native mode of the monitor
+	if [ $((b[54] | b[55])) -ne 0 ]; then
+		native="  native $(( b[56] | ((b[58] >> 4) << 8) ))x$(( b[59] | ((b[61] >> 4) << 8) ))"
+	fi
+	if [ ${bad} -ne 0 ] || [ $((${#b[@]} % 128)) -ne 0 ] || [ "${b[*]:0:8}" != "0 255 255 255 255 255 255 0" ]; then
+		echo -n "EDID CORRUPT"
+	else
+		echo -n "EDID ok"
+	fi
+	printf '  %s  %s %04x%s  %d bytes\n' "${name:-unnamed}" "${mfr}" $(( b[10] | (b[11] << 8) )) "${native}" ${#b[@]}
+}
+
+displayInfo() {
+	local c n=0 st
+
+	for c in /sys/class/drm/card*-HDMI-A-[0-9]; do
+		st=""
+		read -r st 2>/dev/null < "${c}/status"
+		if [ "${st}" = "connected" ]; then
+			line "HDMI${n}" "connected  $(edidInfo "${c}/edid")"
+		else
+			line "HDMI${n}" "${st:-unknown}"
+		fi
+		n=$((n + 1))
+	done
+	[ ${n} -gt 0 ] || line "HDMI" "NO DISPLAY DRIVER"
+}
+
+################################################################################
+# Kernel log: errors (and worse) are counted on HDMI and listed on the UART.
+
+kernelErrors() {
+	dmesg -r 2>/dev/null | awk -F'[<>]' '/^<[0-9]+>/ && ($2 % 8) <= 3' | sed 's/^<[0-9]*>//'
+}
+
+kernelInfo() {
+	local n
+	n=$(kernelErrors | wc -l)
+	if [ ${n} -eq 0 ]; then
+		line "Kernel" "${KERNEL_RELEASE}  no errors"
+	else
+		line "Kernel" "${KERNEL_RELEASE}  ${n} ERRORS (listed on the UART)"
+	fi
+}
+
+################################################################################
+# Ethernet
+
+pingResult() {
+	local out loss rtt
+	out="$(ping -c "$2" -W 2 "$1" 2>&1)"
+	loss="$(echo "${out}" | sed -n 's/.* \([0-9]*\)% packet loss.*/\1/p')"
+	rtt="$(echo "${out}" | sed -n 's|.*min/avg/max[^=]*= [0-9.]*/\([0-9.]*\)/.*|\1|p')"
+	if [ -n "${rtt}" ] && [ "${loss:-100}" -lt 100 ]; then
+		echo "ok ${rtt}ms ${loss}% loss"
+	elif [ -n "${loss}" ]; then
+		echo "NO REPLY"
+	else
+		echo "ERROR $(echo "${out}" | tail -n 1)"
+	fi
+}
+
+# The inventory: only the interface and its MAC address.
+ethernetIdentity() {
+	local i
+
+	for i in /sys/class/net/*; do
+		if [ -d "${i}/device" ] && [ ! -d "${i}/wireless" ] && [ "$(cat "${i}/type")" = "1" ]; then
+			ETH_IFC="$(basename "${i}")"
+			break
+		fi
+	done
+	if [ -n "${ETH_IFC}" ]; then
+		S_NET="$(line "Ethernet" "${ETH_IFC} $(cat /sys/class/net/${ETH_IFC}/address)  test pending")"
+	else
+		S_NET="$(line "Ethernet" "${ETH_FITTED:-NO INTERFACE}")"
+	fi
+}
+
+ethernetInfo() {
+	local ifc="${ETH_IFC}" i addr gw link head
+
+	[ -n "${ifc}" ] || return
+	head="${ifc} $(cat /sys/class/net/${ifc}/address)"
+	S_NET="$(line "Ethernet" "${head}  waiting for link")"
+	updateHdmi
+	ip link set "${ifc}" up 2>/dev/null
+	for i in $(seq ${LINK_TIMEOUT}); do
+		[ "$(cat /sys/class/net/${ifc}/carrier 2>/dev/null)" = "1" ] && break
+		sleep 1
+	done
+	if [ "$(cat /sys/class/net/${ifc}/carrier 2>/dev/null)" != "1" ]; then
+		S_NET="$(line "Ethernet" "NO LINK  ${head}")"
+		return
+	fi
+	link="$(cat /sys/class/net/${ifc}/speed)Mb/s $(cat /sys/class/net/${ifc}/duplex) duplex"
+	S_NET="$(line "Ethernet" "${link}  ${head}")"$'\n'"$(line "IPv4" "waiting for DHCP")"
+	updateHdmi
+
+	for i in $(seq ${DHCP_TIMEOUT}); do
+		addr="$(ip -4 addr show dev "${ifc}" 2>/dev/null | sed -n 's/.*inet \([0-9./]*\).*/\1/p' | head -n 1)"
+		[ -n "${addr}" ] && break
+		sleep 1
+	done
+	if [ -z "${addr}" ]; then
+		S_NET="$(line "Ethernet" "${link}  ${head}")"$'\n'"$(line "IPv4" "NO DHCP LEASE")"
+		return
+	fi
+	gw="$(ip -4 route show default 2>/dev/null | sed -n 's/^default via \([0-9.]*\).*/\1/p' | head -n 1)"
+	if [ -n "${gw}" ]; then
+		gw="gateway ${gw} $(pingResult "${gw}" 3)"
+	else
+		gw="no gateway"
+	fi
+	S_NET="$(line "Ethernet" "${link}  ${head}")"$'\n'"$(line "IPv4" "${addr}  ${gw}  ${PING_HOST} ...")"
+	updateHdmi
+	S_NET="$(line "Ethernet" "${link}  ${head}")"$'\n'"$(line "IPv4" "${addr}  ${gw}  ${PING_HOST} $(pingResult "${PING_HOST}" 4)")"
+}
+
+################################################################################
+# Memory test: a single pass of memtester over up to half of the memory. It
+# is the last test and runs at low priority so that the report stays live.
+
+memtestStart() {
+	local total avail
+	total=$(sed -n 's/^MemTotal: *\([0-9]*\) kB/\1/p' /proc/meminfo)
+	avail=$(sed -n 's/^MemAvailable: *\([0-9]*\) kB/\1/p' /proc/meminfo)
+	MEMTEST_MB=$(( total / 2048 ))
+	[ $(( avail / 1024 - 128 )) -lt ${MEMTEST_MB} ] && MEMTEST_MB=$(( avail / 1024 - 128 ))
+	if [ ${MEMTEST_MB} -lt 16 ]; then
+		MEMTEST_STATUS="NOT RUN, not enough free memory"
+		return
+	fi
+	MEMTEST_START=${SECONDS}
+	nice -n 19 memtester ${MEMTEST_MB}M 1 > "${MEMTEST_LOG}" 2>&1 &
+	MEMTEST_PID=$!
+	MEMTEST_STATUS="running"
+}
+
+# Returns 1 when memtester has finished
+memtestPoll() {
+	local failure tests rc
+	failure="$(grep -m 1 -a 'FAILURE' "${MEMTEST_LOG}" 2>/dev/null)"
+	tests=$(grep -a -c ': ok' "${MEMTEST_LOG}" 2>/dev/null)
+	if kill -0 "${MEMTEST_PID}" 2>/dev/null; then
+		if [ -n "${failure}" ]; then
+			MEMTEST_STATUS="FAILED ${failure#*FAILURE: }"
+		else
+			MEMTEST_STATUS="running $(elapsed $((SECONDS - MEMTEST_START))), ${tests:-0} tests ok"
+		fi
+		return 0
+	fi
+	wait "${MEMTEST_PID}"
+	rc=$?
+	if [ ${rc} -eq 0 ]; then
+		MEMTEST_STATUS="passed in $(elapsed $((SECONDS - MEMTEST_START))), ${tests} tests ok"
+	elif [ -n "${failure}" ]; then
+		MEMTEST_STATUS="FAILED ${failure#*FAILURE: }"
+	else
+		MEMTEST_STATUS="FAILED exit code ${rc}"
+	fi
+	MEMTEST_PID=""
+	return 1
+}
+
+################################################################################
+# Report
+
+# The live sections. The kernel log changes rarely so it is read less often.
+refreshLive() {
+	L_CPU="$(cpuInfo)"
+	L_POWER="$(powerInfo)"
+	L_DISPLAY="$(displayInfo)"
+	if [ $((TICK % 5)) -eq 0 ]; then
+		L_KERNEL="$(kernelInfo)"
+	fi
+	TICK=$((TICK + 1))
+}
+
+# Builds REPORT. The status and the memory test are at the top so that they
+# are always visible. ISSUES lists the labels of the lines which report a
+# problem.
+compose() {
+	local body memtest l label last="" up header status
+
+	refreshLive
+	if [ ${MEMTEST_MB} -gt 0 ]; then
+		memtest="$(line "Memtest" "${MEMTEST_MB}MB  ${MEMTEST_STATUS}")"
+	else
+		memtest="$(line "Memtest" "${MEMTEST_STATUS}")"
+	fi
+	body="${S_BOARD}"$'\n'"${L_CPU}"$'\n'"${L_KERNEL}"$'\n\n'
+	body+="${L_POWER}"$'\n\n'
+	body+="${S_STORAGE}"$'\n\n'
+	body+="${S_PCIE}"$'\n'"${S_USB}"$'\n\n'
+	body+="${S_NET}"$'\n'"${S_WIFI}"$'\n'"${S_BT}"$'\n\n'
+	body+="${L_DISPLAY}"
+
+	ISSUES=""
+	while IFS= read -r l; do
+		l="${l#"${DETAIL}"}"
+		label="${l:0:${LABEL_WIDTH}}"
+		label="${label%"${label##*[! ]}"}"
+		[ -n "${label}" ] && last="${label}"
+		if [[ "${l}" =~ ${FAIL_RE} ]] && [[ ", ${ISSUES}, " != *", ${last}, "* ]]; then
+			ISSUES+="${ISSUES:+, }${last}"
+		fi
+	done <<< "${memtest}"$'\n'"${body}"
+
+	read -r up _ < /proc/uptime
+	up=${up%.*}
+	printf -v header '%-80s%s' "Raspberry Pi self-test" \
+		"Uptime $((up / 3600)):$(printf '%02d:%02d' $(((up / 60) % 60)) $((up % 60)))"
+	if [ -n "${ISSUES}" ]; then
+		status="$(line "Status" "${PHASE}  ISSUES: ${ISSUES}")"
+	else
+		status="$(line "Status" "${PHASE}  no issues")"
+	fi
+	REPORT="${header}"$'\n'"${status}"$'\n'"${memtest}"$'\n\n'"${body}"
+}
+
+# Redraw the report in place on HDMI. If it does not fit on the screen (33
+# lines at 1080p) the detail lines are left off, then the blank lines. Lines
+# which report a problem are red and the status is green once the tests have
+# completed without one. Clear to the end of each line and of the screen so
+# that a shorter line or report does not leave old text behind.
+updateHdmi() {
+	local rows="" cols="" lines kept l n i fd sgr text=""
+
+	[ ${#HDMI_FD[@]} -gt 0 ] || return
+	compose
+	read -r rows cols < <(stty -F "${HDMI[0]}" size 2>/dev/null)
+	[[ "${rows}" =~ ^[0-9]+$ ]] && [ "${rows}" -gt 0 ] || rows=33
+	[[ "${cols}" =~ ^[0-9]+$ ]] && [ "${cols}" -gt 1 ] || cols=120
+
+	mapfile -t lines <<< "${REPORT}"
+	if [ ${#lines[@]} -gt ${rows} ]; then
+		kept=()
+		for l in "${lines[@]}"; do
+			[[ "${l}" == "${DETAIL}"* ]] || kept+=("${l}")
+		done
+		lines=("${kept[@]}")
+	fi
+	if [ ${#lines[@]} -gt ${rows} ]; then
+		kept=()
+		for l in "${lines[@]}"; do
+			[ -z "${l}" ] || kept+=("${l}")
+		done
+		lines=("${kept[@]}")
+	fi
+	n=${#lines[@]}
+	[ ${n} -le ${rows} ] || n=${rows}
+
+	for ((i = 0; i < n; i++)); do
+		l="${lines[i]#"${DETAIL}"}"
+		l="${l:0:$((cols - 1))}"
+		sgr=""
+		if [ ${i} -eq 1 ]; then
+			if [ -n "${ISSUES}" ]; then
+				sgr=$'\033[1;31m'
+			elif [ "${PHASE}" = "complete" ]; then
+				sgr=$'\033[1;32m'
+			else
+				sgr=$'\033[1m'
+			fi
+		elif [[ "${l}" =~ ${FAIL_RE} ]]; then
+			sgr=$'\033[1;31m'
+		fi
+		text+="${sgr}${l}"$'\033[0m\033[K'
+		[ $((i + 1)) -lt ${n} ] && text+=$'\n'
+	done
+	text+=$'\033[J'
+	for fd in "${HDMI_FD[@]}"; do
+		printf '\033[H%s' "${text}" >&"${fd}"
+	done
+}
+
+# Plain text on the UART, suitable for capturing in a terminal emulator.
+uartWrite() {
+	local fd text="${1#"${DETAIL}"}"
+
+	text="${text//$'\n'"${DETAIL}"/$'\n'}"
+	for fd in "${UART_FD[@]}"; do
+		printf '%s\r\n' "${text//$'\n'/$'\r\n'}" >&"${fd}"
+	done
+}
+
+uartReport() {
+	[ ${#UART_FD[@]} -gt 0 ] || return
+	compose
+	uartWrite ""
+	uartWrite "${REPORT}"
+	uartWrite ""
+}
+
+# Text which is only logged on the UART. It is not formatted by line() so
+# remove any control characters here.
+uartText() {
+	[ ${#UART_FD[@]} -gt 0 ] || return
+	uartWrite "$(sed 's/[^[:print:]]//g')"
+	uartWrite ""
+}
+
+################################################################################
+
+trap '' INT QUIT TSTP HUP
+shopt -s nullglob
+
+# Every console in /proc/consoles e.g. tty1 (HDMI) and ttyAMA0 / ttyAMA10 (UART)
+HDMI=()
+UART=()
+while read -r con _; do
+	[ -c "/dev/${con}" ] || continue
+	case "${con}" in
+		tty[0-9]*) HDMI+=("/dev/${con}") ;;
+		*) UART+=("/dev/${con}") ;;
+	esac
+done < /proc/consoles
+
+# On BCM2712 also write to uart0 (GPIO 14/15). On BCM2711 ttyAMA0 is normally
+# the Bluetooth UART so it is not used.
+if tr '\0' '\n' < ${DT}/compatible 2>/dev/null | grep -q '^brcm,bcm2712$' &&
+		[ -c /dev/ttyAMA0 ] && [[ ! " ${UART[*]} " =~ " /dev/ttyAMA0 " ]]; then
+	stty -F /dev/ttyAMA0 115200 2>/dev/null
+	UART+=("/dev/ttyAMA0")
+fi
+
+# Each console is opened once, for writing only, and kept open. A terminal
+# which is opened for writing cannot become the controlling terminal and the
+# terminal settings below last for as long as it is open (the settings of a
+# virtual terminal are reset when it is closed).
+HDMI_FD=()
+UART_FD=()
+for con in "${HDMI[@]}"; do
+	exec {fd}> "${con}" && HDMI_FD+=("${fd}")
+done
+for con in "${UART[@]}"; do
+	exec {fd}> "${con}" && UART_FD+=("${fd}")
+done
+
+# Nothing reads the consoles. Disable echo, signals and XON/XOFF flow control
+# so that console input cannot alter, interrupt or stall the report.
+for con in "${HDMI[@]}" "${UART[@]}"; do
+	stty -F "${con}" -echo -isig -ixon -icanon 2>/dev/null
+done
+# The UARTs are output only. Turn off the receiver (CREAD) so that the serial
+# driver discards every received character, and ignore BREAK. The kernel
+# console never reads input and there is no getty or SysRq, so nothing else
+# can take input from the UART.
+for con in "${UART[@]}"; do
+	stty -F "${con}" -cread ignbrk -brkint ||
+		echo "Failed to disable the receiver on ${con}" >&2
+done
+for fd in "${HDMI_FD[@]}"; do
+	printf '\033[2J\033[H' >&"${fd}"
+done
+
+# Inventory. Wait for the drivers of the devices found at boot, then read
+# everything which does not exercise the hardware and log it.
+udevadm settle --timeout=10 2>/dev/null
+boardInfo
+updateHdmi
+wirelessLoad
+mmcInfo identity
+pcieInfo
+usbInfo
+ethernetIdentity
+wirelessInfo
+updateHdmi
+uartReport
+{
+	echo "EEPROM config"
+	echo "${EEPROM_CONFIG:-not available}"
+	echo
+	echo "Kernel errors"
+	kernelErrors
+	echo
+	echo "Firmware log (vclog -m)"
+	vclog -m 2>&1
+} | uartText
+
+# Tests, shortest first. Each result is logged as it completes.
+PHASE="testing storage"
+updateHdmi
+mmcInfo test
+uartWrite "${S_STORAGE}"
+
+PHASE="testing Ethernet"
+ethernetInfo
+wirelessInfo
+uartWrite "${S_NET}"$'\n'"${S_WIFI}"$'\n'"${S_BT}"
+
+# Every driver which is needed has been loaded by now. Do not allow any more
+# kernel modules to be loaded, e.g. for a device which is plugged in later.
+echo 1 > /proc/sys/kernel/modules_disabled
+
+PHASE="testing memory"
+memtestStart
+updateHdmi
+if [ -n "${MEMTEST_PID}" ]; then
+	uartWrite "$(line "Memtest" "${MEMTEST_MB}MB  started")"
+	while memtestPoll; do
+		updateHdmi
+		sleep ${HDMI_REFRESH}
+	done
+fi
+
+PHASE="complete"
+wirelessInfo
+updateHdmi
+uartReport
+{
+	echo "Kernel errors"
+	kernelErrors
+} | uartText
+
+# Keep the HDMI temperature, voltage, throttled and display status up to date.
+while true; do
+	sleep ${HDMI_REFRESH}
+	updateHdmi
+done

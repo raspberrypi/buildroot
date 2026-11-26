@@ -1,0 +1,18 @@
+[Unit]
+Description=Raspberry Pi self-test
+After=systemd-networkd.service systemd-resolved.service systemd-sysctl.service
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/rpi-self-test
+StandardOutput=journal
+StandardError=journal
+RuntimeDirectory=rpi-self-test
+# The self-test only opens the consoles for writing, so they can never become
+# its controlling terminal and console input cannot signal it.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target

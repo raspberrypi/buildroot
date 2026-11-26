@@ -1,0 +1,16 @@
+# The self-test has no login and is not a network server.
+# CONFIG_ADDGROUP is not set
+# CONFIG_ADDUSER is not set
+# CONFIG_DELUSER is not set
+# CONFIG_DNSD is not set
+# CONFIG_GETTY is not set
+# CONFIG_INETD is not set
+# CONFIG_LOGIN is not set
+# CONFIG_MICROCOM is not set
+# CONFIG_PASSWD is not set
+# CONFIG_SU is not set
+# CONFIG_SULOGIN is not set
+# CONFIG_TELNET is not set
+# CONFIG_TFTP is not set
+# CONFIG_VLOCK is not set
+# CONFIG_WGET is not set

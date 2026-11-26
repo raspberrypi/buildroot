@@ -1,0 +1,2 @@
+# Load boot.img (and verify boot.sig if secure-boot is enabled) as a ramdisk.
+boot_ramdisk=1

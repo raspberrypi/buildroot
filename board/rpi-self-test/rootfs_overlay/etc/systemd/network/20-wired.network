@@ -1,0 +1,16 @@
+[Match]
+Type=ether
+
+[Network]
+DHCP=ipv4
+LinkLocalAddressing=no
+IPv6AcceptRA=no
+LLMNR=no
+MulticastDNS=no
+LLDP=no
+EmitLLDP=no
+
+[DHCPv4]
+ClientIdentifier=mac
+UseHostname=no
+UseNTP=no

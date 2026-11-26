@@ -1,0 +1,31 @@
+[all]
+kernel=kernel8.img
+initramfs rootfs.cpio.zst
+enable_uart=1
+uart_2ndstage=1
+disable_overscan=1
+start_file=start4.elf
+fixup_file=fixup4.dat
+
+# Do not read a HAT EEPROM, which could otherwise modify the device-tree.
+force_eeprom_read=0
+
+[pi5]
+# The kernel console is on the debug UART (uart10). Also enable uart0 on
+# GPIO 14/15 so that the report is visible on boards without a debug UART
+# connector e.g. CM5.
+dtparam=uart0=on
+
+# KMS display driver, for the HDMI hot-plug status and EDID.
+dtoverlay=vc4-kms-v3d-pi5,cma-64
+
+[pi4]
+dtoverlay=vc4-kms-v3d-pi4,cma-64
+
+[all]
+
+[cm4]
+# Enable the USB 2.0 host port (host only, gadget support is not built).
+dtoverlay=dwc2,dr_mode=host
+
+[all]

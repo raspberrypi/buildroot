@@ -1,0 +1,9 @@
+config BR2_PACKAGE_HOST_RPI_MAKE_BOOT_IMAGE
+	bool "host rpi-make-boot-image"
+	select BR2_PACKAGE_HOST_DOSFSTOOLS
+	select BR2_PACKAGE_HOST_MTOOLS
+	help
+	  Creates a FAT boot.img ramdisk for the Raspberry Pi
+	  bootloader which is no larger than its contents require.
+
+	  https://github.com/raspberrypi/usbboot
