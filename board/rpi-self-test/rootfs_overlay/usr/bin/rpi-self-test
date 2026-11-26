@@ -16,7 +16,12 @@
 # registers and read speed is measured by discarding the data that is read,
 # nothing is mounted and no file-system or user data is displayed.
 
-PING_HOST="${PING_HOST:-www.google.com}"
+# The Internet test is a single HTTPS request to Raspberry Pi. The serial
+# number, board revision, SDRAM size and AVS voltage are sent so that it can be matched
+# with the manufacturing records. Nothing else is sent, see the readme.
+REPORT_HOST="downloads.raspberrypi.com"
+REPORT_URL="https://${REPORT_HOST}/rpi-self-test"
+CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
 LINK_TIMEOUT=10
 DHCP_TIMEOUT=20
 WIRELESS_TIMEOUT=12
@@ -31,7 +36,7 @@ RUN_DIR=/run/rpi-self-test
 MEMTEST_LOG=${RUN_DIR}/memtester.log
 
 # Status text which marks a line as an issue. These are always upper case.
-FAIL_RE='NO (LINK|DHCP LEASE|REPLY|EDID|INTERFACE|DISPLAY DRIVER)|NOT (DETECTED|LOADED|FOUND|READABLE|RUN)|READ ERROR|MISMATCH|CORRUPT|FAILED|UNDER-VOLTAGE|EXCEEDED|WARNING|URGENT|[0-9] ERRORS|ERROR '
+FAIL_RE='NOT WRITE-PROTECTED|NO (LINK|DHCP LEASE|REPLY|EDID|INTERFACE|DISPLAY DRIVER)|NOT (DETECTED|LOADED|FOUND|READABLE|RUN)|READ ERROR|MISMATCH|CORRUPT|FAILED|UNDER-VOLTAGE|EXCEEDED|WARNING|URGENT|[0-9] ERRORS|ERROR '
 # Prefix of a lower priority line, see detail()
 DETAIL='~'
 
@@ -64,12 +69,17 @@ BOARD_TYPE=0
 OTP=()
 EEPROM_CONFIG=""
 AVS=""
+AVS_UV=""
+REVISION=""
+SDRAM_CFG=0
+SDRAM_GBIT=0
 CPU_STATIC=""
 CPU_RANGE=""
 KERNEL_RELEASE=""
 WIFI_FITTED=""
 ETH_FITTED=""
 ETH_IFC=""
+INTERNET=""
 
 dtString() {
 	[ -f "$1" ] && tr -d '\0' < "$1"
@@ -180,20 +190,35 @@ boardAttributes() {
 	echo
 }
 
-sdramInfo() {
-	local row cfg cfg1 gbit rank mem_field=$1
+# Sets SDRAM_CFG and SDRAM_GBIT. If SDRAM_CONFIG is not programmed then the
+# size is taken from the board revision.
+sdramConfig() {
+	local row cfg1 mem_field=$1
 
+	SDRAM_CFG=0
 	if [ "${CHIP}" = BCM2712 ]; then
 		row=${OTP34}
-		[ -n "${row}" ] || { echo "OTP NOT READABLE"; return; }
-		cfg=$((0x${row} & 0xfff))
-		cfg1=$(((0x${row} >> 16) & 0xfff))
-		[ ${cfg1} -eq 0 ] || cfg=${cfg1}
+		if [ -n "${row}" ]; then
+			SDRAM_CFG=$((0x${row} & 0xfff))
+			cfg1=$(((0x${row} >> 16) & 0xfff))
+			[ ${cfg1} -eq 0 ] || SDRAM_CFG=${cfg1}
+		fi
 	else
 		row=${OTP33}
-		[ -n "${row}" ] || { echo "OTP NOT READABLE"; return; }
-		cfg=$(((0x${row} >> 8) & 0x1ff))
+		[ -n "${row}" ] && SDRAM_CFG=$(((0x${row} >> 8) & 0x1ff))
 	fi
+	SDRAM_GBIT=$(sdramSizeGbit ${SDRAM_CFG})
+	if [ ${SDRAM_GBIT} -eq 0 ] && [[ "${mem_field}" =~ ^[0-6]$ ]]; then
+		SDRAM_GBIT=$((2 << mem_field))
+	fi
+}
+
+sdramInfo() {
+	local row cfg=${SDRAM_CFG} gbit rank mem_field=$1
+
+	row=${OTP33}
+	[ "${CHIP}" = BCM2712 ] && row=${OTP34}
+	[ -n "${row}" ] || { echo "OTP NOT READABLE"; return; }
 	if [ ${cfg} -eq 0 ]; then
 		echo "SDRAM_CONFIG not programmed"
 		return
@@ -232,6 +257,7 @@ boardInfo() {
 	revhex="$(dtHex ${DT}/system/linux,revision)"
 	rev=$((0x${revhex:-0}))
 	[ -n "${revhex}" ] && revhex="$(printf '%x' ${rev})"
+	REVISION="${revhex}"
 	if [ $(( (rev >> 23) & 1 )) -eq 1 ]; then
 		mem_field=$(( (rev >> 20) & 7 ))
 		mem="  $(memsizeName ${mem_field})"
@@ -249,6 +275,7 @@ boardInfo() {
 	done <<< "$(vcgencmd otp_dump 2>/dev/null)"
 	OTP33="${OTP[33]}"
 	OTP34="${OTP[34]}"
+	sdramConfig "${mem_field}"
 
 	# Board attributes (OTP row 33). Compute Modules record whether Wi-Fi
 	# is fitted and CM4S never has it.
@@ -264,8 +291,12 @@ boardInfo() {
 	EEPROM_CONFIG="$(vcgencmd bootloader_config 2>/dev/null)"
 	AVS="$(vcgencmd get_config over_voltage_avs 2>/dev/null)"
 	AVS="${AVS#*=}"
-	# Reported in hex, in uV.
-	[[ "${AVS}" =~ ^(0x[0-9a-fA-F]+|[0-9]+)$ ]] && AVS="$((AVS))uV"
+	# In uV, reported in decimal or as a 32-bit hex value.
+	if [[ "${AVS}" =~ ^(0x[0-9a-fA-F]{1,8}|-?[0-9]{1,9})$ ]]; then
+		AVS_UV=$((AVS))
+		[ ${AVS_UV} -ge $((0x80000000)) ] && AVS_UV=$((AVS_UV - 0x100000000))
+		AVS="${AVS_UV}uV"
+	fi
 
 	# The parts of the live sections which do not change.
 	part="$(sed -n 's/^CPU part[[:space:]]*: //p' /proc/cpuinfo | head -n 1)"
@@ -607,7 +638,7 @@ mmcInfo() {
 		esac
 		found=1
 
-		local d="${blk}/device" dev type label manf size host ios bus="" start ms speed
+		local d="${blk}/device" dev type label manf size host ios bus="" start ms speed ro
 		dev="$(basename "${blk}")"
 		type="$(cat "${d}/type" 2>/dev/null)"
 		size=$(( $(cat "${blk}/size") / 2048 ))
@@ -647,7 +678,10 @@ mmcInfo() {
 		else
 			out+="$(line "" "${speed}  ${bus}")"$'\n'
 		fi
-		out+="$(detail "Partitions" "$(partitionInfo "${blk}")")"$'\n'
+		# Also done by a udev rule for every block device.
+		busybox blockdev --setro "/dev/${dev}" 2>/dev/null
+		[ "$(cat "${blk}/ro")" = "1" ] && ro="write-protected  " || ro="NOT WRITE-PROTECTED  "
+		out+="$(detail "Partitions" "${ro}$(partitionInfo "${blk}")")"$'\n'
 	done
 	[ ${found} -eq 1 ] || out="$(line "eMMC/SD" "none found")"
 	S_STORAGE="${out%$'\n'}"
@@ -894,6 +928,75 @@ pingResult() {
 	fi
 }
 
+# Most boards have no battery backed clock and the HTTPS certificate cannot be
+# checked without the date, so it is taken from the Date header of a plain
+# HTTP request to the same server. The clock is only ever moved forwards from
+# the build date, so this cannot be used to make an old certificate valid.
+clockFromServer() {
+	local hdr mon new now
+
+	hdr="$(curl -q -s -I -o /dev/null -w '%header{date}' --proto '=http' \
+		--connect-timeout 8 --max-time 10 -A rpi-self-test \
+		"http://${REPORT_HOST}/" 2>/dev/null)"
+	[[ "${hdr}" =~ ^[A-Z][a-z]{2},\ ([0-9]{2})\ ([A-Z][a-z]{2})\ ([0-9]{4})\ ([0-9]{2}:[0-9]{2}:[0-9]{2})\ GMT$ ]] || return 1
+	case "${BASH_REMATCH[2]}" in
+		Jan) mon=01 ;; Feb) mon=02 ;; Mar) mon=03 ;; Apr) mon=04 ;;
+		May) mon=05 ;; Jun) mon=06 ;; Jul) mon=07 ;; Aug) mon=08 ;;
+		Sep) mon=09 ;; Oct) mon=10 ;; Nov) mon=11 ;; Dec) mon=12 ;;
+		*) return 1 ;;
+	esac
+	new="$(date -u -d "${BASH_REMATCH[3]}-${mon}-${BASH_REMATCH[1]} ${BASH_REMATCH[4]}" +%s 2>/dev/null)"
+	[[ "${new}" =~ ^[0-9]+$ ]] || return 1
+	printf -v now '%(%s)T' -1
+	if [ "${new}" -gt "${now}" ]; then
+		date -u -s "@${new}" > /dev/null 2>&1 || return 1
+	fi
+}
+
+curlError() {
+	case "$1" in
+		5|6) echo "DNS lookup" ;;
+		7) echo "could not connect" ;;
+		28) echo "timeout" ;;
+		35) echo "TLS handshake" ;;
+		60) echo "certificate not trusted" ;;
+		*) echo "curl error $1" ;;
+	esac
+}
+
+# The query sent to REPORT_URL. Every value is checked so that only the
+# expected characters can be sent.
+reportQuery() {
+	local s64
+
+	s64="$(dtString ${DT}/chosen/rpi-serial64)"
+	[[ "${s64}" =~ ^[0-9a-f]{16}$ ]] || s64="$(dtString ${DT}/serial-number)"
+	[[ "${s64}" =~ ^[0-9a-f]{16}$ ]] || s64=""
+	[[ "${REVISION}" =~ ^[0-9a-f]{1,8}$ ]] || REVISION=""
+	echo "serial64=${s64}&board-revision=${REVISION}&sdram-size-gbit=${SDRAM_GBIT}&over_voltage_avs=${AVS_UV}"
+}
+
+# Sets INTERNET to the result of fetching REPORT_URL. Any reply from the
+# server over a verified HTTPS connection is a pass, the reply is discarded.
+internetTest() {
+	local out rc code secs
+
+	clockFromServer
+	out="$(curl -q -s -o /dev/null -w '%{http_code} %{time_total}' --proto '=https' \
+		--tlsv1.2 --cacert "${CA_BUNDLE}" --connect-timeout 8 --max-time 15 \
+		-A rpi-self-test "${REPORT_URL}?$1" 2>/dev/null)"
+	rc=$?
+	read -r code secs <<< "${out}"
+	[[ "${secs}" =~ ^[0-9]+\.[0-9]{2} ]] && secs="${BASH_REMATCH[0]}s"
+	if [ ${rc} -ne 0 ]; then
+		INTERNET="Internet FAILED $(curlError ${rc})"
+	elif [[ "${code}" =~ ^2 ]]; then
+		INTERNET="Internet ok ${secs}"
+	else
+		INTERNET="Internet ok ${secs} (HTTP ${code})"
+	fi
+}
+
 # The inventory: only the interface and its MAC address.
 ethernetIdentity() {
 	local i
@@ -912,7 +1015,7 @@ ethernetIdentity() {
 }
 
 ethernetInfo() {
-	local ifc="${ETH_IFC}" i addr gw link head
+	local ifc="${ETH_IFC}" i addr gw link head eth query
 
 	[ -n "${ifc}" ] || return
 	head="${ifc} $(cat /sys/class/net/${ifc}/address)"
@@ -928,7 +1031,8 @@ ethernetInfo() {
 		return
 	fi
 	link="$(cat /sys/class/net/${ifc}/speed)Mb/s $(cat /sys/class/net/${ifc}/duplex) duplex"
-	S_NET="$(line "Ethernet" "${link}  ${head}")"$'\n'"$(line "IPv4" "waiting for DHCP")"
+	eth="$(line "Ethernet" "${link}  ${head}")"$'\n'
+	S_NET="${eth}$(line "IPv4" "waiting for DHCP")"
 	updateHdmi
 
 	for i in $(seq ${DHCP_TIMEOUT}); do
@@ -937,7 +1041,7 @@ ethernetInfo() {
 		sleep 1
 	done
 	if [ -z "${addr}" ]; then
-		S_NET="$(line "Ethernet" "${link}  ${head}")"$'\n'"$(line "IPv4" "NO DHCP LEASE")"
+		S_NET="${eth}$(line "IPv4" "NO DHCP LEASE")"
 		return
 	fi
 	gw="$(ip -4 route show default 2>/dev/null | sed -n 's/^default via \([0-9.]*\).*/\1/p' | head -n 1)"
@@ -946,9 +1050,11 @@ ethernetInfo() {
 	else
 		gw="no gateway"
 	fi
-	S_NET="$(line "Ethernet" "${link}  ${head}")"$'\n'"$(line "IPv4" "${addr}  ${gw}  ${PING_HOST} ...")"
+	S_NET="${eth}$(line "IPv4" "${addr}  ${gw}  Internet ...")"
 	updateHdmi
-	S_NET="$(line "Ethernet" "${link}  ${head}")"$'\n'"$(line "IPv4" "${addr}  ${gw}  ${PING_HOST} $(pingResult "${PING_HOST}" 4)")"
+	query="$(reportQuery)"
+	internetTest "${query}"
+	S_NET="${eth}$(line "IPv4" "${addr}  ${gw}  ${INTERNET}")"$'\n'"$(detail "Sent" "${query}")"
 }
 
 ################################################################################

@@ -1,16 +1,63 @@
-# The self-test has no login and is not a network server.
+# The self-test has no login, is not a network server and only needs the
+# text tools used by rpi-self-test. bash is the only shell.
+CONFIG_SH_IS_NONE=y
+# CONFIG_SH_IS_ASH is not set
+# CONFIG_ASH is not set
 # CONFIG_ADDGROUP is not set
 # CONFIG_ADDUSER is not set
+# CONFIG_ARP is not set
+# CONFIG_ARPING is not set
+# CONFIG_CHROOT is not set
+# CONFIG_CROND is not set
+# CONFIG_CRONTAB is not set
+# CONFIG_DELGROUP is not set
 # CONFIG_DELUSER is not set
+# CONFIG_DEVMEM is not set
 # CONFIG_DNSD is not set
+# CONFIG_ETHER_WAKE is not set
+# CONFIG_FDFORMAT is not set
+# CONFIG_FDISK is not set
 # CONFIG_GETTY is not set
+# CONFIG_HDPARM is not set
+# CONFIG_HEXEDIT is not set
+# CONFIG_I2CDETECT is not set
+# CONFIG_I2CDUMP is not set
+# CONFIG_I2CGET is not set
+# CONFIG_I2CSET is not set
+# CONFIG_I2CTRANSFER is not set
+# CONFIG_IFCONFIG is not set
+# CONFIG_IFDOWN is not set
+# CONFIG_IFUP is not set
 # CONFIG_INETD is not set
+# CONFIG_INIT is not set
+# CONFIG_KLOGD is not set
+# CONFIG_LINUXRC is not set
 # CONFIG_LOGIN is not set
+# CONFIG_LOSETUP is not set
+# CONFIG_MDEV is not set
 # CONFIG_MICROCOM is not set
+# CONFIG_MKDOSFS is not set
+# CONFIG_MKE2FS is not set
+# CONFIG_MKPASSWD is not set
+# CONFIG_MKSWAP is not set
+# CONFIG_NSLOOKUP is not set
 # CONFIG_PASSWD is not set
+# CONFIG_PIVOT_ROOT is not set
+# CONFIG_ROUTE is not set
+# CONFIG_SSL_SERVER is not set
 # CONFIG_SU is not set
 # CONFIG_SULOGIN is not set
+# CONFIG_SWAPOFF is not set
+# CONFIG_SWAPON is not set
+# CONFIG_SWITCH_ROOT is not set
+# CONFIG_SYSLOGD is not set
 # CONFIG_TELNET is not set
 # CONFIG_TFTP is not set
+# CONFIG_TRACEROUTE is not set
+# CONFIG_UDHCPC is not set
+# CONFIG_VI is not set
 # CONFIG_VLOCK is not set
 # CONFIG_WGET is not set
+# CONFIG_HWCLOCK is not set
+# Used to write-protect the block devices.
+CONFIG_BLOCKDEV=y

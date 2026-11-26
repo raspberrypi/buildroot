@@ -1,0 +1,3 @@
+# Write-protect every block device (eMMC, SD, NVMe) as soon as it appears.
+# The self-test only ever reads from storage.
+ACTION=="add", SUBSYSTEM=="block", RUN+="/bin/busybox blockdev --setro $devnode"

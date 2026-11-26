@@ -35,6 +35,39 @@ done
 # Do not probe attached disks for btrfs, which the kernel does not support.
 rm -f "${TARGET_DIR}/usr/lib/udev/rules.d/64-btrfs.rules"
 
+# Only the Wi-Fi / Bluetooth firmware for BCM2711 and BCM2712 boards (CYW43455
+# and CYW43456) is needed.
+FIRMWARE_DIR="${TARGET_DIR}/usr/lib/firmware"
+rm -rf "${FIRMWARE_DIR}/synaptics"
+rm -f "${FIRMWARE_DIR}"/*/*4343[0-9A]* \
+	"${FIRMWARE_DIR}"/*/*3-model-*
+
+# Names are resolved from /etc files and DNS. The systemd name service
+# plugins are large and are not needed.
+rm -f "${TARGET_DIR}"/usr/lib/libnss_systemd.so* \
+	"${TARGET_DIR}"/usr/lib/libnss_resolve.so* \
+	"${TARGET_DIR}"/usr/lib/libnss_myhostname.so*
+sed -i -E -e 's/^(passwd|group|shadow):.*/\1:\t\tfiles/' \
+	-e 's/^hosts:.*/hosts:\t\tfiles dns/' "${TARGET_DIR}/etc/nsswitch.conf"
+
+rm -rf "${TARGET_DIR}/usr/share/bash-completion"
+
+# Tools which could start a program, mount a disk or change the boot setup.
+# Nothing in the self-test uses them.
+for prog in bootctl hwclock mount.ddi systemd-creds systemd-dissect \
+	systemd-mount systemd-pty-forward systemd-run systemd-socket-activate \
+	systemd-stdio-bridge systemd-umount systemd-vpick wcurl; do
+	rm -f "${TARGET_DIR}/usr/bin/${prog}"
+done
+for unit in systemd-creds.socket systemd-factory-reset.socket; do
+	rm -f "${TARGET_DIR}/usr/lib/systemd/system/sockets.target.wants/${unit}"
+done
+
+# curl is given the CA bundle, so the individual certificates and the links
+# to them are not needed.
+find "${TARGET_DIR}/etc/ssl/certs" -mindepth 1 ! -name ca-certificates.crt -delete
+rm -rf "${TARGET_DIR}/usr/share/ca-certificates"
+
 # Make sure that nothing is left which could provide a login or a shell
 # with elevated privileges.
 for dir in bin sbin usr/bin usr/sbin; do

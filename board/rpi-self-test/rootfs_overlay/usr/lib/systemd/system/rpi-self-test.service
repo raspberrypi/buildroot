@@ -4,7 +4,7 @@ After=systemd-networkd.service systemd-resolved.service systemd-sysctl.service
 
 [Service]
 Type=simple
-ExecStart=/usr/sbin/rpi-self-test
+ExecStart=/usr/bin/rpi-self-test
 StandardOutput=journal
 StandardError=journal
 RuntimeDirectory=rpi-self-test

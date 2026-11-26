@@ -24,27 +24,41 @@ fi
 rm -f "${BINARIES_DIR}"/*.dtb
 cp -f "${KERNEL_BUILD_DIR}/arch/arm64/boot/dts/broadcom/"bcm271[12]*.dtb "${BINARIES_DIR}"
 
-# Only the overlays used by config.txt.
-rm -rf "${BINARIES_DIR}/self-test-overlays"
-mkdir -p "${BINARIES_DIR}/self-test-overlays/overlays"
+# boot.img: the firmware, device-trees, kernel, initramfs and only the
+# overlays used by config.txt. rpi-make-boot-image makes the FAT file-system
+# no larger than these files need, which keeps the boot time down.
+STAGING="${ROOTPATH_TMP}/boot"
+mkdir -p "${STAGING}/overlays"
+for dtb in bcm2711-rpi-4-b bcm2711-rpi-400 bcm2711-rpi-cm4 bcm2711-rpi-cm4s \
+		bcm2712-rpi-5-b bcm2712d0-rpi-5-b bcm2712-d-rpi-5-b bcm2712-rpi-500 \
+		bcm2712-rpi-cm5-cm5io bcm2712-rpi-cm5-cm4io \
+		bcm2712-rpi-cm5l-cm5io bcm2712-rpi-cm5l-cm4io; do
+	cp "${BINARIES_DIR}/${dtb}.dtb" "${STAGING}"
+done
+cp "${BINARIES_DIR}/kernel8.img" "${BINARIES_DIR}/rootfs.cpio.zst" "${STAGING}"
+for f in cmdline.txt config.txt fixup4.dat start4.elf; do
+	cp "${BINARIES_DIR}/rpi-firmware/${f}" "${STAGING}"
+done
 # bcm2712d0 is applied by the firmware on BCM2712 D0 boards.
 for ovl in bcm2712d0 dwc2 vc4-kms-v3d-pi4 vc4-kms-v3d-pi5; do
-	cp -f "${KERNEL_BUILD_DIR}/arch/arm64/boot/dts/overlays/${ovl}.dtbo" \
-		"${BINARIES_DIR}/self-test-overlays/overlays/"
+	cp "${KERNEL_BUILD_DIR}/arch/arm64/boot/dts/overlays/${ovl}.dtbo" \
+		"${STAGING}/overlays"
 done
 
-run_genimage() {
-	rm -rf "${GENIMAGE_TMP}"
-	genimage \
-		--rootpath "${ROOTPATH_TMP}"   \
-		--tmppath "${GENIMAGE_TMP}"    \
-		--inputpath "${BINARIES_DIR}"  \
-		--outputpath "${BINARIES_DIR}" \
-		--config "$1"
-}
-
 rm -f "${BINARIES_DIR}/boot.img" "${BINARIES_DIR}/boot.sig" "${BINARIES_DIR}/sdcard.img"
-run_genimage "${BOARD_DIR}/genimage.cfg"
+rpi-make-boot-image -a 64 -d "${STAGING}" -o "${BINARIES_DIR}/boot.img"
 
+# sdcard.img: a FAT partition holding config.txt and the unsigned boot.img
+SDCARD="${ROOTPATH_TMP}/sdcard"
+mkdir -p "${SDCARD}"
 cp -f "${BOARD_DIR}/config-sd.txt" "${BINARIES_DIR}/config.txt"
-run_genimage "${BOARD_DIR}/genimage-sdcard.cfg"
+cp "${BINARIES_DIR}/config.txt" "${BINARIES_DIR}/boot.img" "${SDCARD}"
+rpi-make-boot-image -d "${SDCARD}" -o "${BINARIES_DIR}/sdcard.vfat"
+
+rm -rf "${GENIMAGE_TMP}"
+genimage \
+	--rootpath "${ROOTPATH_TMP}"   \
+	--tmppath "${GENIMAGE_TMP}"    \
+	--inputpath "${BINARIES_DIR}"  \
+	--outputpath "${BINARIES_DIR}" \
+	--config "${BOARD_DIR}/genimage-sdcard.cfg"
