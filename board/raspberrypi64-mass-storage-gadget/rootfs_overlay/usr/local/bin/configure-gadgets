@@ -43,6 +43,11 @@ if [ ${count} -lt ${MSD_TIMEOUT} ]; then
    echo "Storage device found after ${count}s"
 fi
 
+# Bound the write-back cache so a host SYNCHRONIZE CACHE on a slow card
+# completes within the host's SCSI command timeout (typically 30s).
+echo 33554432 > /proc/sys/vm/dirty_bytes
+echo 8388608 > /proc/sys/vm/dirty_background_bytes
+
 mkdir -p "${CONFIGFS}"
 modprobe libcomposite
 mount none "${CONFIGFS}" -t configfs
