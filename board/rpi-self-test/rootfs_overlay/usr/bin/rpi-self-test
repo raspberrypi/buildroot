@@ -20,7 +20,7 @@
 # the two memory tests. The serial number, board revision, SDRAM size, AVS
 # voltage, whether secure-boot is programmed and the memory test result are
 # sent so that it can be matched with the manufacturing records. Nothing else
-# is sent, see the readme.
+# is sent, see README.md at the top of the repo.
 REPORT_HOST="downloads.raspberrypi.com"
 REPORT_URL="https://${REPORT_HOST}/rpi-self-test"
 CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
