@@ -10,6 +10,19 @@ set -e
 SYSTEMD_DIR="${TARGET_DIR}/etc/systemd/system"
 mkdir -p "${SYSTEMD_DIR}"
 
+# The build identity which is shown in the header of the report: the short
+# commit id of this buildroot tree, marked -dirty if a tracked file has been
+# modified, and the build date (SOURCE_DATE_EPOCH for a reproducible build).
+BOARD_DIR="$(dirname "$0")"
+BUILD_COMMIT="$(git -C "${BOARD_DIR}" rev-parse --short=10 HEAD 2>/dev/null || true)"
+if [ -z "${BUILD_COMMIT}" ]; then
+	BUILD_COMMIT="unknown"
+elif [ -n "$(git -C "${BOARD_DIR}" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
+	BUILD_COMMIT="${BUILD_COMMIT}-dirty"
+fi
+BUILD_DATE="$(date -u ${SOURCE_DATE_EPOCH:+-d "@${SOURCE_DATE_EPOCH}"} +%Y-%m-%d)"
+echo "${BUILD_COMMIT} ${BUILD_DATE}" > "${TARGET_DIR}/etc/rpi-self-test-version"
+
 for unit in \
 	autovt@.service \
 	console-getty.service \
@@ -35,12 +48,15 @@ done
 # Do not probe attached disks for btrfs, which the kernel does not support.
 rm -f "${TARGET_DIR}/usr/lib/udev/rules.d/64-btrfs.rules"
 
-# Only the Wi-Fi / Bluetooth firmware for BCM2711 and BCM2712 boards (CYW43455
-# and CYW43456) is needed.
+# Only the Wi-Fi / Bluetooth firmware for BCM2837, BCM2711 and BCM2712 boards
+# (CYW43430A1, CYW43455 and CYW43456) is needed. Remove the firmware for the
+# Zero family and Pico W.
 FIRMWARE_DIR="${TARGET_DIR}/usr/lib/firmware"
 rm -rf "${FIRMWARE_DIR}/synaptics"
-rm -f "${FIRMWARE_DIR}"/*/*4343[0-9A]* \
-	"${FIRMWARE_DIR}"/*/*3-model-*
+rm -f "${FIRMWARE_DIR}"/*/*4343[69A]* \
+	"${FIRMWARE_DIR}"/*/*43430[bB]0* \
+	"${FIRMWARE_DIR}"/*/*model-zero* \
+	"${FIRMWARE_DIR}"/*/*0-compute-module*
 
 # Names are resolved from /etc files and DNS. The systemd name service
 # plugins are large and are not needed.
@@ -62,11 +78,6 @@ done
 for unit in systemd-creds.socket systemd-factory-reset.socket; do
 	rm -f "${TARGET_DIR}/usr/lib/systemd/system/sockets.target.wants/${unit}"
 done
-
-# curl is given the CA bundle, so the individual certificates and the links
-# to them are not needed.
-find "${TARGET_DIR}/etc/ssl/certs" -mindepth 1 ! -name ca-certificates.crt -delete
-rm -rf "${TARGET_DIR}/usr/share/ca-certificates"
 
 # Make sure that nothing is left which could provide a login or a shell
 # with elevated privileges.

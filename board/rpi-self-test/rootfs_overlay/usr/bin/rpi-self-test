@@ -8,17 +8,19 @@
 # The inventory (board, OTP, storage, PCIe, USB, displays) is collected and
 # logged to the UART, with the EEPROM config, kernel errors and firmware log,
 # before any hardware is exercised. The tests then run in order of increasing
-# duration: storage read, Ethernet and finally the memory test. Each result
-# is logged to the UART as it completes and the report is logged again at the
-# end.
+# duration: storage read, Ethernet, a quick memory test and finally the full
+# memory test. Each result is logged to the UART as it completes and the
+# report is logged again at the end.
 #
 # The report is strictly read-only: storage devices are identified from their
 # registers and read speed is measured by discarding the data that is read,
 # nothing is mounted and no file-system or user data is displayed.
 
-# The Internet test is a single HTTPS request to Raspberry Pi. The serial
-# number, board revision, SDRAM size and AVS voltage are sent so that it can be matched
-# with the manufacturing records. Nothing else is sent, see the readme.
+# The Internet test is an HTTPS request to Raspberry Pi, made after each of
+# the two memory tests. The serial number, board revision, SDRAM size, AVS
+# voltage, whether secure-boot is programmed and the memory test result are
+# sent so that it can be matched with the manufacturing records. Nothing else
+# is sent, see the readme.
 REPORT_HOST="downloads.raspberrypi.com"
 REPORT_URL="https://${REPORT_HOST}/rpi-self-test"
 CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
@@ -26,12 +28,16 @@ LINK_TIMEOUT=10
 DHCP_TIMEOUT=20
 WIRELESS_TIMEOUT=12
 MMC_READ_MB=64
+# The quick memory test. The full test is half of the memory.
+MEMTEST_QUICK_MB=256
 HDMI_REFRESH=2
 # 1080p with the 16x32 font is 120x33 characters
 WIDTH=118
 LABEL_WIDTH=13
 
 DT=/proc/device-tree
+# The commit id and date of the build, written by post-build.sh
+VERSION_FILE=/etc/rpi-self-test-version
 RUN_DIR=/run/rpi-self-test
 MEMTEST_LOG=${RUN_DIR}/memtester.log
 
@@ -62,7 +68,16 @@ TICK=0
 MEMTEST_PID=""
 MEMTEST_MB=0
 MEMTEST_START=0
-MEMTEST_STATUS="waiting for the other tests"
+MEMTEST_STATUS=""
+# The test which is running (quick or full), its result (pass, fail or
+# not-run) and the text of the tests which have finished.
+MEMTEST_NAME=""
+MEMTEST_RESULT=""
+MEMTEST_DONE=""
+# Customer public key hash from OTP ("none" if it is not programmed) and whether
+# secure-boot is programmed (1 or 0, empty if the OTP could not be read).
+KEY_HASH=""
+SECURE_BOOT=""
 CHIP=""
 STEPPING=""
 BOARD_TYPE=0
@@ -80,6 +95,10 @@ WIFI_FITTED=""
 ETH_FITTED=""
 ETH_IFC=""
 INTERNET=""
+CLOCK_SET=""
+BUILD=""
+NET_ETH=""
+NET_IPV4=""
 
 dtString() {
 	[ -f "$1" ] && tr -d '\0' < "$1"
@@ -263,6 +282,7 @@ boardInfo() {
 		mem="  $(memsizeName ${mem_field})"
 	fi
 	case $(( (rev >> 12) & 0xf )) in
+		2) CHIP="BCM2837" ;;
 		3) CHIP="BCM2711" ;;
 		4) CHIP="BCM2712" ;;
 	esac
@@ -276,11 +296,15 @@ boardInfo() {
 	OTP33="${OTP[33]}"
 	OTP34="${OTP[34]}"
 	sdramConfig "${mem_field}"
+	secureBootKey
 
 	# Board attributes (OTP row 33). Compute Modules record whether Wi-Fi
-	# is fitted and CM4S never has it.
+	# is fitted and CM4S never has it. CM3 / CM3+ have neither Wi-Fi nor
+	# Ethernet and Pi 3A+ has no Ethernet.
 	attrs=$((0x${OTP33:-0}))
 	case ${BOARD_TYPE} in
+		10|16) WIFI_FITTED="not fitted"; ETH_FITTED="not fitted" ;;
+		14) ETH_FITTED="not fitted" ;;
 		21) WIFI_FITTED="not fitted" ;;
 		20|24|26) [ $((attrs & 0x40000000)) -ne 0 ] && WIFI_FITTED="not fitted (OTP)" ;;
 	esac
@@ -314,14 +338,18 @@ boardInfo() {
 		line "Serial" "$(dtString ${DT}/serial-number)  Revision ${revhex:-unknown}${mem}  ${CHIP} ${STEPPING}"
 		ids="$(identity)"
 		[ -n "${ids}" ] && detail "Identity" "${ids}"
-		if [ -n "${mem_field}" ]; then
-			line "SDRAM" "$(sdramInfo ${mem_field})"
+		# BCM2837 has no SDRAM_CONFIG or board attributes in OTP, no
+		# secure-boot and no bootloader EEPROM.
+		if [ "${CHIP}" != BCM2837 ]; then
+			if [ -n "${mem_field}" ]; then
+				line "SDRAM" "$(sdramInfo ${mem_field})"
+			fi
+			detail "Board OTP" "$(boardAttributes ${BOARD_TYPE})"
 		fi
-		detail "Board OTP" "$(boardAttributes ${BOARD_TYPE})"
 		line "Secure boot" "$(secureBoot)"
 		if bl=$(rpi-bootloader-version 2>/dev/null); then
 			line "Bootloader" "$(echo "${bl}" | sed -n 1p)  $(echo "${bl}" | sed -n 's/^version \([0-9a-f]\{12\}\).*/\1/p')"
-		else
+		elif [ "${CHIP}" != BCM2837 ]; then
 			line "Bootloader" "version not available"
 		fi
 		fw="$(vcgencmd version 2>/dev/null)"
@@ -332,7 +360,7 @@ boardInfo() {
 		else
 			line "Firmware" "${fw}"
 		fi
-		line "Boot" "$(bootInfo)"
+		[ "${CHIP}" != BCM2837 ] && line "Boot" "$(bootInfo)"
 	)"
 }
 
@@ -372,17 +400,37 @@ identity() {
 # and the bootloader anti-rollback (ARB) version, which is a thermometer code.
 # BCM2711: hash in rows 47-54, ARB in the top byte of row 55.
 # BCM2712: hash in rows 37-44, ARB in rows 45-48.
-secureBoot() {
-	local first i hash="" arb=0 signed
-	if [ "${CHIP}" = BCM2712 ]; then
-		first=37
-	else
-		first=47
+#
+# Sets KEY_HASH and SECURE_BOOT. Secure-boot is programmed if the public key
+# hash is not zero.
+secureBootKey() {
+	local first=47 i hash=""
+
+	KEY_HASH=""
+	SECURE_BOOT=""
+	if [ "${CHIP}" = BCM2837 ]; then
+		SECURE_BOOT=0
+		return
 	fi
+	[ "${CHIP}" = BCM2712 ] && first=37
 	for i in $(seq ${first} $((first + 7))); do
-		[ -n "${OTP[i]}" ] || { echo "OTP NOT READABLE"; return; }
+		[ -n "${OTP[i]}" ] || return
 		hash+="${OTP[i]:6:2}${OTP[i]:4:2}${OTP[i]:2:2}${OTP[i]:0:2}"
 	done
+	if [ -n "${hash//0/}" ]; then
+		KEY_HASH="${hash}"
+		SECURE_BOOT=1
+	else
+		KEY_HASH="none"
+		SECURE_BOOT=0
+	fi
+}
+
+secureBoot() {
+	local i arb=0 signed
+
+	[ "${CHIP}" != BCM2837 ] || { echo "not supported by ${CHIP}"; return; }
+	[ -n "${KEY_HASH}" ] || { echo "OTP NOT READABLE"; return; }
 	if [ "${CHIP}" = BCM2712 ]; then
 		for i in 45 46 47 48; do
 			arb=$((arb + $(popcount 0x${OTP[i]:-0})))
@@ -390,9 +438,10 @@ secureBoot() {
 	else
 		arb=$(popcount $(( (0x${OTP[55]:-0} >> 24) & 0xff )))
 	fi
-	[ -n "${hash//0/}" ] || hash="none"
 	signed="$(dtU32 ${DT}/chosen/bootloader/signed)"
-	printf 'key %s  ARB %d  signed 0x%x\n' "${hash}" ${arb} ${signed:-0}
+	# The hash identifies the customer public key. It is not a secret and
+	# is not the key which signs the images.
+	printf 'pubkey hash %s  ARB %d  signed 0x%x\n' "${KEY_HASH}" ${arb} ${signed:-0}
 }
 
 bootModeName() {
@@ -428,6 +477,7 @@ bootInfo() {
 
 cpuName() {
 	case "$1" in
+		0xd03) echo "Cortex-A53" ;;
 		0xd08) echo "Cortex-A72" ;;
 		0xd0b) echo "Cortex-A76" ;;
 		*) echo "part $1" ;;
@@ -965,15 +1015,19 @@ curlError() {
 }
 
 # The query sent to REPORT_URL. Every value is checked so that only the
-# expected characters can be sent.
+# expected characters can be sent. It is printed as two lines, the device and
+# the results, which are joined to make the query.
 reportQuery() {
-	local s64
+	local s64 sb="" result=""
 
 	s64="$(dtString ${DT}/chosen/rpi-serial64)"
 	[[ "${s64}" =~ ^[0-9a-f]{16}$ ]] || s64="$(dtString ${DT}/serial-number)"
 	[[ "${s64}" =~ ^[0-9a-f]{16}$ ]] || s64=""
 	[[ "${REVISION}" =~ ^[0-9a-f]{1,8}$ ]] || REVISION=""
+	[[ "${SECURE_BOOT}" =~ ^[01]$ ]] && sb=${SECURE_BOOT}
+	[[ "${MEMTEST_RESULT}" =~ ^(pass|fail|not-run)$ ]] && result=${MEMTEST_RESULT}
 	echo "serial64=${s64}&board-revision=${REVISION}&sdram-size-gbit=${SDRAM_GBIT}&over_voltage_avs=${AVS_UV}"
+	echo "&secure-boot=${sb}&memtest-mb=$((MEMTEST_MB))&memtest=${result}"
 }
 
 # Sets INTERNET to the result of fetching REPORT_URL. Any reply from the
@@ -981,7 +1035,7 @@ reportQuery() {
 internetTest() {
 	local out rc code secs
 
-	clockFromServer
+	[ -n "${CLOCK_SET}" ] || { clockFromServer && CLOCK_SET=1; }
 	out="$(curl -q -s -o /dev/null -w '%{http_code} %{time_total}' --proto '=https' \
 		--tlsv1.2 --cacert "${CA_BUNDLE}" --connect-timeout 8 --max-time 15 \
 		-A rpi-self-test "${REPORT_URL}?$1" 2>/dev/null)"
@@ -1015,7 +1069,7 @@ ethernetIdentity() {
 }
 
 ethernetInfo() {
-	local ifc="${ETH_IFC}" i addr gw link head eth query
+	local ifc="${ETH_IFC}" i addr gw link head eth
 
 	[ -n "${ifc}" ] || return
 	head="${ifc} $(cat /sys/class/net/${ifc}/address)"
@@ -1050,24 +1104,43 @@ ethernetInfo() {
 	else
 		gw="no gateway"
 	fi
-	S_NET="${eth}$(line "IPv4" "${addr}  ${gw}  Internet ...")"
+	NET_ETH="${eth}"
+	NET_IPV4="${addr}  ${gw}"
+	S_NET="${eth}$(line "IPv4" "${NET_IPV4}  Internet test pending")"
+}
+
+# The Internet test, which reports the result of the memory test that has
+# just finished. It is skipped if there is no IPv4 address.
+internetReport() {
+	local query
+
+	[ -n "${NET_IPV4}" ] || return
+	S_NET="${NET_ETH}$(line "IPv4" "${NET_IPV4}  Internet ...")"
 	updateHdmi
-	query="$(reportQuery)"
-	internetTest "${query}"
-	S_NET="${eth}$(line "IPv4" "${addr}  ${gw}  ${INTERNET}")"$'\n'"$(detail "Sent" "${query}")"
+	mapfile -t query <<< "$(reportQuery)"
+	internetTest "${query[0]}${query[1]}"
+	S_NET="${NET_ETH}$(line "IPv4" "${NET_IPV4}  ${INTERNET}")"$'\n'"$(detail "Sent" "${query[0]}")"$'\n'"$(detail "" "${query[1]}")"
+	uartWrite "${S_NET}"
 }
 
 ################################################################################
-# Memory test: a single pass of memtester over up to half of the memory. It
-# is the last test and runs at low priority so that the report stays live.
+# Memory test: a quick test of MEMTEST_QUICK_MB, then a full test of up to
+# half of the memory. Each is a single pass of memtester and is followed by
+# the Internet test, which reports the result. They are the last tests and
+# run at low priority so that the report stays live.
 
+memTotalMb() {
+	echo $(( $(sed -n 's/^MemTotal: *\([0-9]*\) kB/\1/p' /proc/meminfo) / 1024 ))
+}
+
+# $1 is the size in MB, which is reduced to fit in the available memory.
 memtestStart() {
-	local total avail
-	total=$(sed -n 's/^MemTotal: *\([0-9]*\) kB/\1/p' /proc/meminfo)
+	local avail
 	avail=$(sed -n 's/^MemAvailable: *\([0-9]*\) kB/\1/p' /proc/meminfo)
-	MEMTEST_MB=$(( total / 2048 ))
+	MEMTEST_MB=$1
 	[ $(( avail / 1024 - 128 )) -lt ${MEMTEST_MB} ] && MEMTEST_MB=$(( avail / 1024 - 128 ))
 	if [ ${MEMTEST_MB} -lt 16 ]; then
+		MEMTEST_MB=0
 		MEMTEST_STATUS="NOT RUN, not enough free memory"
 		return
 	fi
@@ -1092,7 +1165,9 @@ memtestPoll() {
 	fi
 	wait "${MEMTEST_PID}"
 	rc=$?
+	MEMTEST_RESULT="fail"
 	if [ ${rc} -eq 0 ]; then
+		MEMTEST_RESULT="pass"
 		MEMTEST_STATUS="passed in $(elapsed $((SECONDS - MEMTEST_START))), ${tests} tests ok"
 	elif [ -n "${failure}" ]; then
 		MEMTEST_STATUS="FAILED ${failure#*FAILURE: }"
@@ -1101,6 +1176,33 @@ memtestPoll() {
 	fi
 	MEMTEST_PID=""
 	return 1
+}
+
+# The test which is running, or which has just finished.
+memtestText() {
+	if [ ${MEMTEST_MB} -gt 0 ]; then
+		echo "${MEMTEST_NAME} ${MEMTEST_MB}MB ${MEMTEST_STATUS}"
+	else
+		echo "${MEMTEST_NAME} ${MEMTEST_STATUS}"
+	fi
+}
+
+# Runs one memory test and waits for it. $1 is its name and $2 the size in MB.
+memtestRun() {
+	MEMTEST_NAME="$1"
+	MEMTEST_RESULT="not-run"
+	memtestStart "$2"
+	updateHdmi
+	if [ -n "${MEMTEST_PID}" ]; then
+		uartWrite "$(line "Memtest" "${MEMTEST_NAME} ${MEMTEST_MB}MB started")"
+		while memtestPoll; do
+			updateHdmi
+			sleep ${HDMI_REFRESH}
+		done
+	fi
+	uartWrite "$(line "Memtest" "$(memtestText)")"
+	MEMTEST_DONE+="${MEMTEST_DONE:+  }$(memtestText)"
+	MEMTEST_NAME=""
 }
 
 ################################################################################
@@ -1124,11 +1226,9 @@ compose() {
 	local body memtest l label last="" up header status
 
 	refreshLive
-	if [ ${MEMTEST_MB} -gt 0 ]; then
-		memtest="$(line "Memtest" "${MEMTEST_MB}MB  ${MEMTEST_STATUS}")"
-	else
-		memtest="$(line "Memtest" "${MEMTEST_STATUS}")"
-	fi
+	memtest="${MEMTEST_DONE}"
+	[ -n "${MEMTEST_NAME}" ] && memtest+="${memtest:+  }$(memtestText)"
+	memtest="$(line "Memtest" "${memtest:-waiting for the other tests}")"
 	body="${S_BOARD}"$'\n'"${L_CPU}"$'\n'"${L_KERNEL}"$'\n\n'
 	body+="${L_POWER}"$'\n\n'
 	body+="${S_STORAGE}"$'\n\n'
@@ -1149,7 +1249,7 @@ compose() {
 
 	read -r up _ < /proc/uptime
 	up=${up%.*}
-	printf -v header '%-80s%s' "Raspberry Pi self-test" \
+	printf -v header '%-80s%s' "Raspberry Pi self-test${BUILD:+  ${BUILD}}" \
 		"Uptime $((up / 3600)):$(printf '%02d:%02d' $(((up / 60) % 60)) $((up % 60)))"
 	if [ -n "${ISSUES}" ]; then
 		status="$(line "Status" "${PHASE}  ISSUES: ${ISSUES}")"
@@ -1295,6 +1395,13 @@ for fd in "${HDMI_FD[@]}"; do
 	printf '\033[2J\033[H' >&"${fd}"
 done
 
+# The build of this image e.g. "d6b38d32fd  2026-11-27"
+if read -r commit built _ < "${VERSION_FILE}" &&
+		[[ "${commit}" =~ ^[0-9a-f]{7,40}(-dirty)?$|^unknown$ ]] &&
+		[[ "${built}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+	BUILD="${commit}  ${built}"
+fi 2>/dev/null
+
 # Inventory. Wait for the drivers of the devices found at boot, then read
 # everything which does not exercise the hardware and log it.
 udevadm settle --timeout=10 2>/dev/null
@@ -1334,16 +1441,14 @@ uartWrite "${S_NET}"$'\n'"${S_WIFI}"$'\n'"${S_BT}"
 # kernel modules to be loaded, e.g. for a device which is plugged in later.
 echo 1 > /proc/sys/kernel/modules_disabled
 
+# The result of each memory test is sent by the Internet test.
+PHASE="testing memory (quick)"
+memtestRun quick ${MEMTEST_QUICK_MB}
+internetReport
+
 PHASE="testing memory"
-memtestStart
-updateHdmi
-if [ -n "${MEMTEST_PID}" ]; then
-	uartWrite "$(line "Memtest" "${MEMTEST_MB}MB  started")"
-	while memtestPoll; do
-		updateHdmi
-		sleep ${HDMI_REFRESH}
-	done
-fi
+memtestRun full $(( $(memTotalMb) / 2 ))
+internetReport
 
 PHASE="complete"
 wirelessInfo

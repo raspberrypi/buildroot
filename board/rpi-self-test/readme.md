@@ -5,6 +5,11 @@ with RPIBOOT, checks the hardware and shows the result on HDMI and on the
 UART. It supports BCM2711 (Pi 4, Pi 400, CM4, CM4S) and BCM2712 (Pi 5,
 Pi 500, CM5).
 
+The image also contains the firmware (`start.elf`), device-trees and drivers
+for BCM2837 (Pi 3B, 3A+, 3B+, CM3), which can run it from an SD card. This has
+not been tested yet. BCM2837 cannot load `boot.img` over RPIBOOT and has no
+secure-boot, so the signing sections do not apply to it.
+
 Run it as a pre-check, before the regular tools such as the bootloader
 recovery images or `mass-storage-gadget64`. It changes nothing on the device
 and gives no access to it, so it can also be signed for devices with
@@ -36,7 +41,9 @@ When it boots it first collects an inventory, without exercising anything:
 * Board model, serial numbers, revision, memory size and SoC stepping.
 * SDRAM size from OTP, checked against the board revision.
 * Secure-boot state: the hash of the customer public key programmed in OTP
-  (in the same form as `sha256sum`) and the bootloader anti-rollback version.
+  (shown as `pubkey hash`, in the same form as `sha256sum`) and the
+  bootloader anti-rollback version. This is not the private key which signs
+  the images, which is never on the device.
 * Bootloader and firmware versions, the boot order and how it was booted.
 * CPU type, clocks and temperature; voltages and throttling. On the Pi 5
   family the supply voltage and rails are measured by the PMIC
@@ -49,22 +56,31 @@ When it boots it first collects an inventory, without exercising anything:
 * HDMI: whether a monitor is connected, and its name from the EDID.
 * The number of errors in the kernel log.
 
-It then runs three tests, shortest first:
+It then runs these tests, shortest first:
 
 1. Storage: reads 64MB from each eMMC / SD and reports the speed. The data
    is discarded.
-2. Ethernet: link speed, DHCP, a ping of the gateway, then one HTTPS
-   request to Raspberry Pi (see "What it sends to Raspberry Pi").
-3. Memory: one pass of `memtester` over up to half of the memory. This
-   takes several minutes.
+2. Ethernet: link speed, DHCP and a ping of the gateway.
+3. Quick memory test: one pass of `memtester` over 256MB.
+4. Full memory test: one pass of `memtester` over up to half of the memory.
+   This takes several minutes.
+
+After each memory test it makes one HTTPS request to Raspberry Pi, which is
+the Internet test and reports the result of that memory test (see "What it
+sends to Raspberry Pi"). A board which fails or hangs during the full test
+has already reported the quick one.
 
 ## Reading the result
 
 **HDMI** shows one screen at 1080p which is redrawn in place, so it can be
-photographed. The second line is the status: what is running and a list of
-any issues. Lines which report a problem are red and the status turns green
-when everything has finished without one. Status text for a problem is always
-in upper case, e.g. `NO LINK`, `READ ERROR`, `FAILED`.
+photographed. The first line shows which build of the image is running: the
+short git commit id of the buildroot tree and the build date, e.g.
+`d6b38d32fd  2026-11-27`. The commit id ends in `-dirty` if the image was
+built from modified source. The second line is the status: what is running
+and a list of any issues. Lines which report a problem are red and the
+status turns green when everything has finished without one. Status text
+for a problem is always in upper case, e.g. `NO LINK`, `READ ERROR`,
+`FAILED`.
 
 **UART** (115200 baud) gets the same information as plain text for capture
 with a terminal emulator:
@@ -72,7 +88,8 @@ with a terminal emulator:
 * The inventory is logged before any test starts, followed by the EEPROM
   config, the kernel errors and the firmware log. If a board hangs during a
   test this has already been logged.
-* Each test result is logged when it completes.
+* Each test result is logged when it completes, and each request to
+  Raspberry Pi when it is made.
 * The whole report is logged again when the memory test finishes.
 
 The UART shows a few extra lines which are left off HDMI when the screen is
@@ -98,16 +115,17 @@ access to a device. Read this section before you decide.
   server of any kind, IPv6 is off, and Wi-Fi and Bluetooth are detected but
   never brought up. The device only answers pings.
 * **No access to storage.** Nothing is mounted and the kernel has no disk
-  file-systems, no USB storage support and no USB gadget (so the device
+  file-systems, no USB storage support, no USB network adapter drivers other
+  than the on-board Ethernet of the Pi 3, and no USB gadget (so the device
   cannot present its eMMC to a host). The read test discards what it reads.
   An encrypted (e.g. LUKS) partition is never unlocked.
 * **No secrets from OTP.** The device private key and the customer OTP rows
   are not read, and the kernel OTP and `/dev/mem` drivers are not built. The
-  key hash which is shown is the hash of your *public* key.
+  `pubkey hash` which is shown is the hash of your *public* key.
 * **Nothing new can be loaded.** The kernel command line, config.txt and
   initramfs are inside the signed `boot.img`, HAT EEPROMs are not read, and
   kernel module loading is turned off before the memory test starts. The
-  reply to the one web request is discarded.
+  replies to the web requests are discarded.
 * **Nothing is written to the device.** Every eMMC, SD and NVMe device is
   write-protected as soon as it is detected (shown as `write-protected` in
   the UART log). The kernel has no SPI driver, so it cannot reach the
@@ -127,10 +145,12 @@ Anyone who can run the image on a device sees, on HDMI and the UART:
 
 ### What it sends to Raspberry Pi
 
-To test the Internet connection the image fetches one URL with `curl`:
+To test the Internet connection the image fetches one URL with `curl`. It
+does this twice: after the quick memory test and again after the full memory
+test.
 
 ```
-https://downloads.raspberrypi.com/rpi-self-test?serial64=<serial>&board-revision=<rev>&sdram-size-gbit=<size>&over_voltage_avs=<uV>
+https://downloads.raspberrypi.com/rpi-self-test?serial64=<serial>&board-revision=<rev>&sdram-size-gbit=<size>&over_voltage_avs=<uV>&secure-boot=<0|1>&memtest-mb=<size>&memtest=<result>
 ```
 
 * `serial64` - the 64-bit serial number of the device.
@@ -138,19 +158,26 @@ https://downloads.raspberrypi.com/rpi-self-test?serial64=<serial>&board-revision
 * `sdram-size-gbit` - the size of the SDRAM in gigabits.
 * `over_voltage_avs` - the core voltage adjustment set at manufacture, in
   microvolts.
+* `secure-boot` - `1` if a customer public key hash is programmed in OTP,
+  otherwise `0`. The hash itself is not sent.
+* `memtest-mb` - the amount of memory tested by the memory test which has
+  just finished, in megabytes.
+* `memtest` - the result of that memory test: `pass`, `fail` or `not-run`.
 
 Raspberry Pi uses these to match the device with its manufacturing records.
 Like any web request, the server also sees the public IP address it came
-from. The MAC addresses, the EEPROM config, the key hash, the test results
-and everything else in the report are **not** sent. The reply is discarded:
-the test passes if the server answers over a verified HTTPS connection.
+from. The MAC addresses, the EEPROM config, the public key hash, the results
+of the other tests and everything else in the report are **not** sent. The
+replies are discarded: the test passes if the server answers over a verified
+HTTPS connection.
 
 Most boards have no clock battery, and a certificate cannot be checked
 without the date. So the image first makes one plain HTTP request to
 `http://downloads.raspberrypi.com/` (no parameters) and sets the clock from
 the `Date` header of the reply. The clock is only ever moved forwards.
 
-The line marked `Sent` in the UART log shows exactly what was sent.
+The lines marked `Sent` in the UART log show exactly what was sent each
+time.
 
 If you do not want this, change `REPORT_URL` and `REPORT_HOST` at the top of
 `rootfs_overlay/usr/bin/rpi-self-test` to a server of your own, or remove the
@@ -168,7 +195,7 @@ Otherwise the only network traffic is a DHCP request (with the hostname
   firmware for the device private key or to program OTP, as it can in any
   image you sign. This is the main risk.
 * The image contains `curl` and a TLS library, which process data from the
-  network. `curl` is only run for the two requests above, each restricted
+  network. `curl` is only run for the requests above, each restricted
   to a single protocol, and it is built without proxy or cookie support.
 * The image has been reviewed but has not had an independent security audit
   or penetration test.
@@ -190,40 +217,85 @@ device. Never sign an image which does expose storage (e.g.
 
 ## Building
 
+The host needs the
+[packages required by Buildroot](https://buildroot.org/downloads/manual/manual.html#requirement)
+and `git`.
+
 ```
-git clone --branch rpi-self-test git@github.com:raspberrypi/buildroot.git
+git clone --branch rpi-self-test https://github.com/raspberrypi/buildroot.git
 cd buildroot
 make rpi-self-test_defconfig
 make
 ```
 
+The first build downloads and compiles the toolchain, kernel and packages,
+which takes a while. Build from the git checkout rather than a source
+archive, otherwise the commit id in the report is `unknown`. After changing a
+file under `board/rpi-self-test`, run `make` again to rebuild the image.
+
 Output in `output/images`:
 
 * `boot.img` - firmware, kernel, device-trees and initramfs (unsigned).
 * `config.txt` - `boot_ramdisk=1`, selects `boot.img`.
-* `sdcard.img` - `config.txt` + unsigned `boot.img`. Write this to an SD
-  card or USB drive to run the self-test without RPIBOOT on a device which
-  does not have secure-boot enabled.
+* `sdcard.img` - `config.txt` + unsigned `boot.img`, see "From an SD card or
+  USB drive". The contents of `boot.img` and `bootcode.bin` are also on the
+  card as separate files for BCM2837, which cannot load a `boot.img`.
 
 Building it yourself, from source you have reviewed, is the best way to know
 what you are signing.
 
-## Running and signing
+## Running
 
-The [usbboot](https://github.com/raspberrypi/usbboot) repo has an
-`rpi-self-test` directory with the RPIBOOT files and instructions. In short:
+Nothing is installed on the device: the image is loaded into memory each
+time it is run. For the full test connect an HDMI monitor and Ethernet with
+DHCP and Internet access, and optionally a UART (115200 baud).
+
+### Over RPIBOOT
+
+Build `rpiboot` as described in the
+[usbboot](https://github.com/raspberrypi/usbboot) readme. Its `rpi-self-test`
+directory has the other files which RPIBOOT needs:
 
 ```
 cd usbboot/rpi-self-test
-./download.sh               # or copy your own boot.img here
+cp /path/to/buildroot/output/images/boot.img .   # or ./download.sh for the released image
 sudo ../rpiboot -d .
 ```
 
-For a device with secure-boot enabled, sign it first with your key:
+Put the device into RPIBOOT mode as for any other `rpiboot` image, e.g. fit
+the `nRPIBOOT` jumper on a Compute Module IO board.
+
+### From an SD card or USB drive
+
+On a device which does not have secure-boot enabled, write `sdcard.img` to
+an SD card or USB drive with Raspberry Pi Imager ("Use custom") or `dd`:
 
 ```
+sudo dd if=output/images/sdcard.img of=/dev/sdX bs=4M conv=fsync
+```
+
+Replace `/dev/sdX` with the card, and check it with `lsblk` first because
+`dd` overwrites it.
+
+A device with secure-boot enabled only loads a signed `boot.img`. The FAT
+partition of `sdcard.img` has no free space, so instead copy `boot.img`, the
+`boot.sig` created by `sign.sh` (see "Signing") and `config.txt` to the first
+FAT partition of a card.
+
+## Signing
+
+For a device with secure-boot enabled, sign `boot.img` with your key before
+running `rpiboot`:
+
+```
+cd usbboot/rpi-self-test
 ./sign.sh private.pem
 ```
 
-`sign.sh` signs `boot.img`, and also handles the Pi 5 firmware
-counter-signature and the public key needed in RPIBOOT mode.
+`sign.sh` creates `boot.sig`, and also handles the Pi 5 firmware
+counter-signature and the public key needed in RPIBOOT mode. It can use a
+HSM wrapper script instead of a private key file, see the readme in that
+directory. Sign again after replacing `boot.img`.
+
+The signed files will not boot on a Pi 5 which does not have secure-boot
+enabled. Run `./reset.sh` to go back to the unsigned files.

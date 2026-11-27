@@ -4,8 +4,8 @@ initramfs rootfs.cpio.zst
 enable_uart=1
 uart_2ndstage=1
 disable_overscan=1
-start_file=start4.elf
-fixup_file=fixup4.dat
+# The firmware is selected by the board: start4.elf / fixup4.dat on BCM2711
+# and start.elf / fixup.dat on BCM2837.
 
 # Do not read a HAT EEPROM, which could otherwise modify the device-tree.
 force_eeprom_read=0
@@ -21,6 +21,9 @@ dtoverlay=vc4-kms-v3d-pi5,cma-64
 
 [pi4]
 dtoverlay=vc4-kms-v3d-pi4,cma-64
+
+[pi3]
+dtoverlay=vc4-kms-v3d,cma-64
 
 [all]
 
